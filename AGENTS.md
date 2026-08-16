@@ -1,6 +1,3 @@
-This is a monorepo containing web services and CLI tools. Use pnpm workspaces to manage
-dependencies. See each package's AGENTS.md for specific guidelines.
-
 <!-- intent-skills:start -->
 
 ## Skill Loading
