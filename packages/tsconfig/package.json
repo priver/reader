@@ -1,0 +1,11 @@
+{
+  "name": "@priver/tsconfig",
+  "version": "0.0.0",
+  "private": true,
+  "exports": {
+    ".": "./tsconfig.json",
+    "./library": "./tsconfig.library.json",
+    "./react": "./tsconfig.react.json",
+    "./vite": "./tsconfig.vite.json"
+  }
+}
