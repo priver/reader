@@ -1,0 +1,7 @@
+{
+  "extends": ["@priver/tsconfig", "@priver/tsconfig/react", "@priver/tsconfig/vite"],
+  "compilerOptions": {
+    "types": ["vite/client"]
+  },
+  "include": ["src/**/*", "*.config.ts"]
+}

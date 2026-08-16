@@ -1,0 +1,50 @@
+{
+  "$schema": "./node_modules/turbo/schema.json",
+  "futureFlags": {
+    "affectedUsingTaskInputs": true,
+    "errorsOnlyShowHash": true,
+    "experimentalObservability": true,
+    "filterUsingTasks": true,
+    "globalConfiguration": true,
+    "longerSignatureKey": true,
+    "pruneIncludesGlobalFiles": true,
+    "watchUsingTaskInputs": true
+  },
+  "global": {
+    "ui": "tui"
+  },
+  "tasks": {
+    "//#check-format": {
+      "description": "Check repository formatting with Oxfmt",
+      "outputLogs": "errors-only"
+    },
+    "//#check-deps": {
+      "description": "Validate dependency declarations across the workspace",
+      "outputLogs": "errors-only"
+    },
+    "//#lint": {
+      "description": "Lint source files across packages",
+      "outputLogs": "errors-only"
+    },
+    "test": {
+      "description": "Run package test suites",
+      "outputLogs": "errors-only"
+    },
+    "build": {
+      "description": "Build distributable outputs for each package",
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", "*.tsbuildinfo"]
+    },
+    "dev": {
+      "description": "Start development tasks and required local services",
+      "cache": false,
+      "persistent": true
+    },
+    "preview": {
+      "description": "Run built applications in preview mode",
+      "dependsOn": ["build"],
+      "cache": false,
+      "persistent": true
+    }
+  }
+}

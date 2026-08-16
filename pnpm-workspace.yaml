@@ -1,0 +1,31 @@
+packages:
+  - apps/*
+  - packages/*
+
+catalog:
+  '@babel/core': ^8.0.1
+  '@rolldown/plugin-babel': ^0.2.3
+  '@tailwindcss/vite': ^4.3.3
+  '@tanstack/react-router': ^1.170.27
+  '@tanstack/router-plugin': ^1.168.30
+  '@types/babel__core': ^7.20.5
+  '@types/react': ^19.2.18
+  '@types/react-dom': ^19.2.4
+  '@vitejs/plugin-react': ^6.0.5
+  babel-plugin-react-compiler: ^1.0.0
+  oxfmt: ^0.63.0
+  oxlint: ^1.78.0
+  oxlint-tsgolint: ^7.0.2001
+  react: ^19.2.8
+  react-dom: ^19.2.8
+  sherif: ^1.13.0
+  tailwindcss: ^4.3.3
+  turbo: ^2.10.10
+  typescript: ^7.0.2
+  vite: ^8.2.1
+
+catalogMode: strict
+
+cleanupUnusedCatalogs: true
+
+engineStrict: true
