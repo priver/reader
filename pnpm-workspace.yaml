@@ -4,6 +4,9 @@ packages:
 
 catalog:
   '@babel/core': ^8.0.1
+  '@priver/oxfmt-config': ^1.0.1
+  '@priver/oxlint-config': ^1.0.1
+  '@priver/tsconfig': ^1.0.0
   '@rolldown/plugin-babel': ^0.2.3
   '@tailwindcss/vite': ^4.3.3
   '@tanstack/react-router': ^1.170.27
@@ -29,3 +32,6 @@ catalogMode: strict
 cleanupUnusedCatalogs: true
 
 engineStrict: true
+
+minimumReleaseAgeExclude:
+  - '@priver/*'
