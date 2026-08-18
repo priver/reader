@@ -13,4 +13,7 @@ export default defineConfig({
     es2026: true,
     browser: true,
   },
+  rules: {
+    'react/jsx-no-literals': 'off',
+  },
 });
