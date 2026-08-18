@@ -11,6 +11,8 @@
     "build": "turbo run build"
   },
   "devDependencies": {
+    "@priver/oxfmt-config": "catalog:",
+    "@priver/oxlint-config": "catalog:",
     "oxfmt": "catalog:",
     "oxlint": "catalog:",
     "oxlint-tsgolint": "catalog:",
