@@ -1,6 +1,5 @@
-import { defineConfig } from 'oxlint';
-
 import { reactConfig } from '@priver/oxlint-config';
+import { defineConfig } from 'oxlint';
 
 export default defineConfig({
   extends: [reactConfig],
