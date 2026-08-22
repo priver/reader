@@ -8,7 +8,7 @@ ranking algorithm. Articles stay in publication order, and the reading view come
 Requirements:
 
 - Node 24.19.0
-- pnpm 11.21.0
+- pnpm 11.22.0
 
 ```sh
 pnpm install
