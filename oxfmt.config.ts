@@ -5,7 +5,7 @@ export default defineConfig({
   ...config,
   ignorePatterns: ['**/*.html', 'pnpm-lock.yaml', '**/routeTree.gen.ts'],
   sortTailwindcss: {
-    stylesheet: './apps/reader/src/style.css',
+    stylesheet: './apps/web/src/style.css',
     functions: ['cva', 'cx'],
   },
 });
