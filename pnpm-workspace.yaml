@@ -5,7 +5,7 @@ packages:
 catalog:
   '@babel/core': ^8.0.1
   '@priver/oxfmt-config': ^1.0.1
-  '@priver/oxlint-config': ^1.0.1
+  '@priver/oxlint-config': ^1.1.0
   '@priver/tsconfig': ^1.0.0
   '@rolldown/plugin-babel': ^0.2.3
   '@tailwindcss/vite': ^4.3.3
@@ -16,8 +16,8 @@ catalog:
   '@types/react-dom': ^19.2.4
   '@vitejs/plugin-react': ^6.1.0
   babel-plugin-react-compiler: ^1.0.0
-  oxfmt: ^0.63.0
-  oxlint: ^1.78.0
+  oxfmt: ^0.64.0
+  oxlint: ^1.79.0
   oxlint-tsgolint: ^7.0.2001
   react: ^19.2.8
   react-dom: ^19.2.8
