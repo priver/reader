@@ -36,6 +36,6 @@
   },
   "tailwindCSS.classFunctions": ["cva", "cx"],
   "tailwindCSS.experimental.configFile": {
-    "apps/reader/src/style.css": "apps/reader/src/**"
+    "apps/web/src/style.css": "apps/web/src/**"
   }
 }

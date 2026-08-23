@@ -1,5 +1,8 @@
 import { createRootRoute, Link, Outlet } from '@tanstack/react-router';
 
+const activeOptions = { exact: true };
+const activeProps = { className: 'bg-stone-200/70 text-stone-950' };
+
 export const Route = createRootRoute({
   component: () => (
     <div className="min-h-dvh bg-stone-50 text-stone-950">
@@ -11,16 +14,16 @@ export const Route = createRootRoute({
           <nav aria-label="Primary" className="flex items-center gap-1 text-sm">
             <Link
               to="/"
-              activeOptions={{ exact: true }}
+              activeOptions={activeOptions}
               className="rounded-full px-3 py-2 text-stone-600 transition-colors hover:bg-stone-200/70 hover:text-stone-950"
-              activeProps={{ className: 'bg-stone-200/70 text-stone-950' }}
+              activeProps={activeProps}
             >
               Home
             </Link>
             <Link
               to="/about"
               className="rounded-full px-3 py-2 text-stone-600 transition-colors hover:bg-stone-200/70 hover:text-stone-950"
-              activeProps={{ className: 'bg-stone-200/70 text-stone-950' }}
+              activeProps={activeProps}
             >
               About
             </Link>

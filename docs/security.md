@@ -1,0 +1,367 @@
+# Security
+
+This document defines the target trust boundaries and security rules through invitation beta.
+Reader's hobby-scale beta does not claim formal compliance certification or operation as a regulated
+service. These engineering requirements and release gates still apply in full.
+
+## Threat boundaries
+
+Reader processes hostile XML, HTML, URLs, and images from arbitrary public publishers. Treat every
+publisher response as untrusted even when another user has already subscribed to the same source.
+
+Primary boundaries:
+
+- Browser to same-origin Nginx, API, and Kratos routes
+- Browser to the cookieless end-user and admin static origins
+- Go feed fetcher to public network
+- Go normalizer to stored article HTML
+- Public `reader.mprvr.net/images/` request to Nginx and private imgproxy
+- Application API and worker to private Object Storage
+- Nginx through the VPC Object Storage service connection to browser-release storage
+- Reader session to private admin authorization
+- Application telemetry to Yandex, the Sentry Free plan, and PostHog
+
+## Feed network policy
+
+The Go worker is the only application component that fetches feeds or website HTML for feed
+discovery. Both paths use the same safe HTTP client and address policy.
+
+Allow:
+
+- Public `http` and `https` URLs
+- Standards-compliant redirects that remain public
+- Conditional HTTP requests
+
+Reject:
+
+- URL user information and separately supplied feed credentials
+- Non-HTTP schemes
+- Loopback, link-local, multicast, private, and cloud metadata addresses
+- Private answers returned after DNS rebinding
+- Redirects to a rejected address or scheme
+- Responses above the configured decompressed limit
+
+Validate every DNS result and every redirect target, not only the initial URL. Pair application
+validation with host firewall rules that block metadata addresses and destinations the service never
+needs.
+
+Initial limits:
+
+| Limit                                      | Value                                                                |
+| ------------------------------------------ | -------------------------------------------------------------------- |
+| Feed response                              | 5 MiB after decompression                                            |
+| Concurrent requests per publisher hostname | 2                                                                    |
+| Redirects                                  | Bounded; exact value set with the HTTP client tests                  |
+| Request duration                           | Bounded; exact connect and total timeouts set with production sizing |
+
+Honor `Retry-After`, send a clear Reader user agent with a contact URL, and apply exponential
+backoff after failures. Manual refresh uses the same queue and network policy.
+
+Reader does not fetch linked article pages through beta.
+
+Website discovery accepts only bounded HTML responses. It limits redirects and discovered
+candidates, and never executes publisher scripts. Set the exact discovery byte and candidate caps
+during implementation, then lock them with tests. These caps cannot exceed the feed-fetch response
+cap.
+
+Reader cannot reliably recognize secret-bearing URL paths and query strings. Before shared
+multi-user ingestion ships, URL canonicalization must define an enforceable policy that prevents
+private capabilities from being treated as globally shareable feeds.
+
+## Feed HTML pipeline
+
+Stored article bodies come only from RSS or Atom fields.
+
+Process in this order:
+
+1. Parse fragment HTML with `golang.org/x/net/html`.
+2. Resolve relative links and images against the entry or feed base URL.
+3. Normalize supported semantic markup.
+4. Replace images with app-owned placeholders and a normalized public image manifest.
+5. Replace approved beta embeds with inert app-owned placeholders.
+6. Apply the strict Bluemonday allowlist as the final transformation.
+7. Derive plain text from sanitized output.
+8. Store only sanitized output and its versioned envelope.
+
+Bluemonday performs the last transformation that accepts publisher-controlled markup. At response
+time, the API may replace typed app-owned image placeholders with generated `<picture>` markup. That
+expansion accepts only normalized manifest fields and fixed server presets. It never copies
+publisher HTML or attributes into the response.
+
+Alpha allows semantic static HTML and proxied images. The sanitizer removes scripts, forms, inline
+styles, event handlers, iframes, objects, embeds, and publisher tracking markup. In beta, trusted
+embeds use click-to-load application components. Reader does not preserve publisher iframes.
+
+The browser never receives unsanitized feed HTML.
+
+## Browser content policy
+
+- Enforce a restrictive Content Security Policy.
+- Use Trusted Types for article HTML sinks where browser support allows.
+- Render sanitized HTML in the application document; do not rely on iframe sandboxing as the primary
+  sanitizer.
+- Permit proxied article and list images only from `reader.mprvr.net/images/` and bundled images
+  only from the configured end-user or admin asset origin.
+- Permit end-user scripts, styles, fonts, and bundled images only from `reader.mprvr.net`; permit
+  the admin equivalents only from `reader-admin.mprvr.net`.
+- Permit frames only for explicit click-to-load trusted providers in beta.
+- Open external links with `noopener` and `noreferrer`.
+- Keep API and Kratos browser flows same-origin on each public or private SPA vhost to avoid broad
+  CORS policy.
+- Send static asset requests without credentials. Each static origin allows only its application
+  origin through CORS and never enables credentialed CORS.
+- Send image requests to `reader.mprvr.net` without credentials.
+
+Generate the exact CSP from implemented dependencies and verify it in browser tests. Do not copy a
+permissive development policy into production.
+
+## Edge and origin
+
+- Accept public application, end-user asset, and image traffic through Cloudflare only.
+- Restrict public Nginx ingress to current Cloudflare source ranges where the Yandex network path
+  permits it.
+- Require Cloudflare Authenticated Origin Pulls or an equivalent mTLS client check at Nginx.
+- Expose Network Load Balancer health checks through a separate narrowly scoped path.
+- Reject direct requests that cannot authenticate as Cloudflare, even when they reach the stable
+  origin address.
+- Use strict TLS from browser to Cloudflare and Cloudflare to Nginx.
+- Validate the `Host` header before routing. Reject `admin.reader.priver.org` and
+  `reader-admin.mprvr.net` on every public listener.
+- Expose both admin hostnames only on the private Nginx listener reached through Yandex Bastion.
+  Cloudflare does not proxy either hostname.
+
+## Browser release assets
+
+- Restrict the content, end-user release, and admin release buckets at the service level to the
+  configured VPC Object Storage service connection. Disable public-network and management-console
+  access.
+
+Apply these authenticated permissions. Condition every permission on TLS and the configured service
+connection. Deny every action not listed.
+
+| Identity          | Object scope                       | Allowed S3 permissions                                                                 |
+| ----------------- | ---------------------------------- | -------------------------------------------------------------------------------------- |
+| API content       | Content-envelope prefix            | `s3:GetObject`                                                                         |
+| Worker content    | Content-envelope prefix            | `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`                                      |
+| Release publisher | HTML, asset, and manifest prefixes | `s3:GetObject`, `s3:PutObject`                                                         |
+| Release cleanup   | HTML, asset, and manifest prefixes | Prefix-scoped `s3:ListBucket`, manifest `s3:GetObject`, eligible-key `s3:DeleteObject` |
+| Nginx             | No authenticated scope             | None                                                                                   |
+
+- The API and worker cannot list buckets or change bucket policy, lifecycle, versioning, or other
+  configuration. Content-bucket versioning provides recovery from an erroneous worker deletion.
+- Allow anonymous `s3:GetObject` only for release HTML and asset object prefixes when
+  `yc:private-endpoint-id` matches that service connection and `aws:SecureTransport` is true. Grant
+  no anonymous list, write, delete, policy, or configuration operation. Deny unsigned reads of
+  browser manifests and every other release-bucket key.
+- Limit cleanup deletion to expired release documents and manifests and to asset candidates absent
+  from the protected manifest union. The publishing protocol uses conditional writes and rejects an
+  existing key with different bytes.
+- Serialize publication and cleanup under one release-maintenance lock. Hold it from before the
+  publisher checks or uploads assets until after manifest and HTML publication. Cleanup recomputes
+  the protected manifest union under the lock immediately before deleting candidates.
+- Give Nginx no Object Storage credential. It sends unsigned `GET` and `HEAD` requests through the
+  private endpoint.
+- Publish end-user `/assets/<content-hash>.<ext>` through the public `reader.mprvr.net` vhost and
+  admin assets through the private `reader-admin.mprvr.net` vhost. Disable directory listing and SPA
+  fallback on both hosts.
+- Route only `/assets/` to release storage and `/images/` to the image cache on `reader.mprvr.net`.
+  Return `404` for every other path, including `/api`, `/auth`, and SPA navigations.
+- Canonicalize object keys before proxying. Reject traversal, encoded separators, unexpected query
+  parameters, and keys outside the configured asset prefix.
+- Strip `Cookie`, `Authorization`, and other browser credentials before the storage request. Static
+  origins do not set cookies and do not return `Access-Control-Allow-Credentials`.
+- Reserve `mprvr.net` for cookieless delivery. No service sets a cookie for that parent domain.
+- Return `Access-Control-Allow-Origin: https://reader.priver.org` on asset and image responses from
+  `reader.mprvr.net`, and `Access-Control-Allow-Origin: https://admin.reader.priver.org` from
+  `reader-admin.mprvr.net`.
+- Set explicit content types, `X-Content-Type-Options: nosniff`, and long `public, immutable`
+  caching on content-addressed assets. Return a real `404` for a missing key.
+- Keep versioned HTML and browser manifests outside the publicly routed asset prefix. Application
+  vhosts serve HTML with revalidation rather than immutable caching.
+- Do not publish browser source maps. Upload them directly to the configured error-reporting service
+  when release diagnostics require them.
+
+Admin assets are reachable only through the same Bastion path as the admin application. They still
+contain no credentials, environment secrets, or data that substitutes for server-side authorization.
+The API protects every privileged endpoint named by the bundle.
+
+Endpoint-conditioned anonymous reads are network authorization, not workload identity. Any
+compromised workload able to use the permitted service connection can read release HTML and assets.
+Keep content envelopes in a separate bucket that requires authenticated API or worker access even
+through the service connection, and never place secrets in either browser build.
+
+## Image proxy
+
+imgproxy is private behind Nginx. Only Nginx publishes its signed path at
+`https://reader.mprvr.net/images/`.
+
+### URL authorization
+
+- The Go API creates every imgproxy URL when it serves an article or list DTO.
+- Sign the complete `/images/` path, source URL, content version, preset, width, and format with
+  HMAC.
+- Store signing key and salt in Yandex Lockbox.
+- Configure multiple key/salt pairs during rotation and sign new responses with the current pair.
+- Enable imgproxy signature verification in every non-local environment.
+- Use preset-only mode; the client cannot choose arbitrary processing options.
+- Reject unsigned image routes and never route `/images/` to browser-release Object Storage.
+
+Public source URLs may remain visible in encoded paths. Reject URL user information. Never attach
+Reader credentials, cookies, or headers. Reader treats publisher-supplied query strings and path
+capabilities as public because it does not support private feeds. Users must not submit feeds whose
+images depend on confidential URLs. Signatures prevent changes to the source or processing policy.
+
+Durable content stores placeholders and image manifests, not signed URLs. Retiring an old key does
+not require rewriting saved bodies; the next article response receives newly signed paths.
+
+Article and list DTO validators include the signing-key generation. After rotation, conditional
+requests receive a fresh representation rather than retaining retired signatures through `304`.
+
+### Source policy
+
+- Allow only public HTTP(S) image sources.
+- Reject image URL user information before it enters a manifest or lead-image projection.
+- Explicitly disable loopback, link-local, and private source addresses. imgproxy's private-address
+  default must be overridden.
+- Block metadata destinations at the host firewall.
+- Send no browser cookies, authorization headers, or user identity to publishers.
+- Strip browser cookies and authorization headers at the cookieless image vhost before cache lookup
+  or proxying to imgproxy.
+- Verify TLS and bound redirects and download time.
+- Cap source files at 10 MiB and source resolution at 40 megapixels.
+- Keep animation frames, output dimensions, workers, active clients, and request queue bounded.
+- Keep SVG sanitization enabled and rasterize when the selected preset requires it.
+- Disable security-option overrides in request URLs.
+
+The visual presets will determine exact responsive widths and animation behavior. Those design
+choices do not change the security caps.
+
+### Cache policy
+
+- Emit explicit AVIF and WebP paths instead of varying one URL by `Accept`.
+- Include a content-version buster in immutable image paths.
+- Cache successful responses in Cloudflare and the Nginx file cache.
+- Bound the Nginx cache at 5 GiB with a 30-day inactivity target.
+- Use cache locking to prevent duplicate imgproxy work.
+- Briefly cache rejected or missing sources.
+- Serve stale successful images while imgproxy is failing or updating.
+- Use long browser and edge TTLs because a changed content version creates a changed URL.
+
+Cloudflare Free cannot key image variants by `Accept`. Correct behavior requires explicit format
+paths. They are also an optimization.
+
+## Identity
+
+Self-hosted Ory Kratos owns browser identity.
+
+- Email one-time code is the bootstrap and recovery method.
+- Passkeys are optional at bootstrap and preferred after enrollment.
+- Encourage more than one passkey for recovery resilience.
+- In beta, let users link Google login only from an authenticated settings flow.
+- Never merge identities only because two credential types report the same email address.
+- Keep sessions for 30 days and require recent authentication for sensitive changes.
+- Use Secure, HttpOnly, appropriately SameSite, host-only cookies. Do not set a parent-domain cookie
+  that reaches another Reader origin.
+- Protect browser flows and application mutations against CSRF.
+- Rate-limit code requests, verification attempts, invitation requests and redemption, and
+  account-sensitive operations.
+
+The API validates Kratos sessions directly. It does not mint a second application JWT.
+
+## Invitations and administration
+
+- The public request form accepts exactly one email string of at most 254 UTF-8 bytes and no
+  freeform text.
+- Validate invitation emails with the same syntax, canonicalization, and comparison rules used by
+  identity registration.
+- Return the same response for every accepted submission, including when an account, request, or
+  invitation already exists.
+- Accept at most one pending request per email address and expire it after 30 days.
+- Rate-limit requests by network source and an email-derived key without logging the raw address.
+- Treat request submission as idempotent. It creates no registration token and grants no access.
+- Require an administrator to approve or reject requests. Approval or direct administrator issuance
+  is the only way to create an invitation.
+- Bind invitation tokens to one email address.
+- Sign tokens, make them single-use, and expire them after seven days.
+- Store only token verification material required for safe redemption.
+- Deliver issued invitations through Postbox without placing tokens in logs or audit metadata.
+- Keep the admin SPA at `admin.reader.priver.org`, reachable only through Yandex Bastion.
+- Use `reader.priver.org` as the WebAuthn relying-party ID and keep public and admin sessions
+  separate with host-only cookies.
+- Require an enrolled passkey and application admin role.
+- Authorize every admin operation in the Go API.
+- Append an audit record for every admin mutation.
+
+Kratos admin APIs, application database credentials, and Lockbox credentials never reach either SPA.
+
+## Secrets
+
+Yandex Lockbox is authoritative for production secrets, including:
+
+- PostgreSQL credentials and CA material
+- Kratos cookie, cipher, and webhook secrets
+- Postbox SMTP credentials
+- imgproxy key and salt
+- Cloudflare automation credentials
+- API and worker Object Storage credentials when process-scoped workload identities are not
+  available
+- Browser-release publishing and cleanup credentials when workload identity is not available
+- Sentry and PostHog keys where needed server-side
+
+Do not grant content-object permissions to a VM-wide metadata identity available to every container.
+Use separate process-scoped identities for the API and worker, or fetch dedicated least-privilege
+credentials from Lockbox at boot and mount each only into its owning container. Nginx has no Object
+Storage IAM permission or credential; the private endpoint policy grants its bounded release read
+path. Block the Nginx network namespace from cloud metadata and Lockbox. Write runtime secret files
+with restrictive permissions and remove them when a blue or green VM is destroyed.
+
+## Telemetry privacy
+
+Operational telemetry may include service, operation, timing, status class, queue depth, and safe
+opaque IDs.
+
+Exclude:
+
+- Article HTML, plain text, titles, and search queries
+- Feed and article URLs from general logs
+- Email addresses, invitation request details, and invitation tokens
+- Session cookies, passkey data, SMTP credentials, and signed image source paths
+- Object Storage envelopes
+
+The Sentry Free plan receives sanitized frontend failures without article data. Reader adds PostHog
+in beta with autocapture, session replay, and automatic URL capture disabled. Allowlisted events may
+use an opaque user ID to measure four-week retention but carry no source or article properties.
+
+## Runtime hardening
+
+- Run containers as non-root with read-only filesystems where state is unnecessary.
+- Drop Linux capabilities and set CPU, memory, process, and file limits.
+- Publish only Nginx and required administration paths.
+- Keep imgproxy, Kratos admin APIs, workers, and telemetry collectors on private networks.
+- Enforce per-container egress so only intended processes can reach cloud metadata, Lockbox, and
+  authenticated Object Storage operations.
+- Generate and publish SBOMs.
+- Scan application and base images before release.
+- Sign GHCR release images with keyless Cosign and verify deployment identity.
+- Apply OS security updates and weekly Renovate dependency updates.
+
+## Security completion criteria
+
+Security-sensitive work is complete only when:
+
+1. Every new external input has a documented validation and size boundary.
+2. SSRF tests cover DNS, redirects, IPv4, IPv6, and cloud metadata cases.
+3. Sanitizer fixtures cover malicious and malformed HTML.
+4. Browser tests verify CSP, Trusted Types, links, and image-source behavior.
+5. Browser tests verify static-origin CORS, cookie isolation, missing-asset behavior, private admin
+   asset reachability, and public denial.
+6. Browser tests verify signed image routing on `reader.mprvr.net`, cookie stripping, and separation
+   between `/assets/` and `/images/`.
+7. Infrastructure tests verify unsigned release HTML and asset reads work only through the
+   configured VPC service connection; manifests and every other key deny unsigned reads.
+8. Infrastructure tests verify content, publication, and cleanup operations require their scoped
+   identities and the configured service connection, and that Nginx cannot obtain those identities.
+9. Direct origin requests to public application, asset, and image routes fail without Cloudflare
+   origin authentication.
+10. Logs, Sentry, and analytics samples contain no prohibited fields.
+11. The production container scan and `govulncheck` pass, or the change documents the accepted risk.
