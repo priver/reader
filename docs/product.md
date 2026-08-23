@@ -62,8 +62,15 @@ Cloud deployment.
 - Enforce a 500-subscription hosted-service limit per user.
 
 Reader accepts no feed username, password, custom header, or other separate authentication material
-through beta. Secret-bearing URLs are unsupported. Define URL classification and canonicalization
-rules before implementing shared multi-user ingestion.
+through beta. It rejects URL user information and non-HTTP schemes. Reader treats every accepted
+path and query string as public endpoint identity and may reuse the complete URL and feed data
+across accounts that submit the same endpoint. The add-feed flow says this before submission. Users
+must not submit signed, tokenized, invitation-only, or otherwise confidential URLs.
+
+Shared feed records are not a public directory. Reader returns feed URLs only to subscribed users
+and authorized administrators, but it provides no private-feed or token-redaction guarantee. The
+exact endpoint and deduplication rules live in
+[`0007-feed-url-policy.md`](decisions/0007-feed-url-policy.md).
 
 ### Reading
 

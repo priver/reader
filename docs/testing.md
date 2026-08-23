@@ -32,7 +32,7 @@ Test deterministic domain behavior without network or database dependencies:
 
 - Feed refresh interval calculation
 - Failure backoff and cooldown
-- URL and address classification
+- Feed URL classification, canonicalization, redirect identity, and endpoint deduplication
 - Feed-scoped entry identity
 - Read watermark and exception transitions
 - Retention decisions
@@ -78,6 +78,53 @@ The fixture corpus includes:
 - Malicious and malformed HTML
 - Oversized and redirecting responses
 - Image URLs targeting rejected address ranges
+
+### Feed URL fixture contract
+
+The backend URL package and safe HTTP client must implement the following table-driven cases with a
+fake resolver and dialer. Tests never contact publisher sites, public DNS, or cloud metadata
+services.
+
+Canonicalization cases:
+
+- Scheme and host case fold to lowercase. Unicode and A-label host spellings converge.
+- A DNS root dot and matching default port disappear. An empty path becomes `/`, and a fragment
+  disappears.
+- Username, password, username-only, non-HTTP scheme, relative URL, opaque URL, missing host,
+  malformed port, zone-scoped IPv6, embedded controls, and over-limit input fail.
+- `http` versus `https`, path case, trailing slash, repeated slash, dot segment, escaped-octet
+  spelling, non-default port, query order, duplicate query values, and an explicit empty query
+  remain distinct.
+- A public selector such as `?channel_id=UC123` and a token-looking `?token=example` are both
+  preserved and receive the same public-only classification. This locks in the decision not to use a
+  secret heuristic.
+
+Redirect and deduplication cases:
+
+- A `301` or `308` creates an alias and promotes the next permanent endpoint. A `302`, `303`, or
+  `307` is followed for the request but does not create an alias.
+- `300`, `305`, and every other 3xx response outside the allowed set are terminal and are not
+  followed.
+- `A --301--> B --302--> C` makes B canonical and keeps C request-local.
+- Relative `Location` resolution passes through canonicalization.
+- A redirect loop, sixth hop, malformed target, user-information target, unsupported scheme, or
+  non-public target fails.
+- A normalized URL or permanent alias reuses an existing Feed. A permanent redirect to an owned
+  target selects the target Feed and produces one idempotent merge.
+- Temporary redirects, Atom `rel=self`, identical payloads, DNS aliases, path variants, and
+  reordered queries do not merge Feed records.
+
+SSRF cases:
+
+- Reject IPv4 unspecified, loopback, RFC 1918, link-local, carrier-grade NAT, documentation,
+  benchmarking, multicast, reserved, and cloud metadata destinations.
+- Reject IPv6 unspecified, loopback, IPv4-mapped rejected addresses, unique-local, link-local,
+  documentation, multicast, and zone-scoped destinations.
+- Reject `localhost` and ambiguous integer, octal, or hexadecimal IPv4 host spellings.
+- Reject a DNS answer set containing any non-public address, a public first answer followed by a
+  private rebinding answer, and every redirect from a public origin to a rejected destination.
+- Accept synthetic globally routable IPv4 and IPv6 results through the fake resolver and pinned
+  dialer.
 
 Store only fixtures that the project can redistribute. Create a minimal reproduction when a real
 response cannot be committed safely.

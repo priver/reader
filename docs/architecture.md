@@ -189,7 +189,7 @@ exception requires explicit review and documentation.
 
 ### Worker mode
 
-- Discover and validate public RSS and Atom feeds.
+- Discover, canonicalize, and validate public RSS and Atom feed endpoints.
 - Schedule feed refresh from publication and failure history.
 - Fetch feeds with conditional HTTP and publisher-level concurrency limits.
 - Parse and normalize entries.
@@ -224,11 +224,30 @@ Extend that slice through the personal-alpha checklist before adding admin and g
 Implement folders, saving, progress, OPML import and export, search, and operational controls as
 usable end-to-end paths. Test each path through every component it touches.
 
+## Feed endpoint lifecycle
+
+1. The server bounds and canonicalizes a direct feed URL, OPML feed URL, or website URL before
+   endpoint lookup.
+2. A normalized canonical endpoint or permanent alias already owned by a Feed reuses that Feed.
+3. The worker uses the shared safe HTTP client for direct feed fetches and website discovery.
+4. The client validates and pins public DNS answers and reruns URL and address checks on each of at
+   most five redirects.
+5. A leading `301` or `308` chain updates the canonical endpoint and records prior permanent
+   endpoints as aliases. Temporary redirect targets remain request-local.
+6. If a permanent target belongs to another Feed, an idempotent merge converges on that target Feed
+   before ingestion continues.
+7. Payload, entries, titles, site URLs, Atom `rel=self`, DNS aliases, and temporary redirects never
+   merge Feeds.
+
+The complete path and query are public endpoint identity. The exact normalization and capability-URL
+limits live in [`0007-feed-url-policy.md`](decisions/0007-feed-url-policy.md).
+
 ## Feed refresh lifecycle
 
 1. A scheduler selects due feeds from persisted `next_fetch_at` values.
 2. River receives a unique feed-refresh job.
-3. The worker fetches the feed with conditional headers and safe-network checks.
+3. The worker fetches the canonical endpoint with conditional headers, redirect reconciliation, and
+   safe-network checks.
 4. The worker parses RSS or Atom and resolves feed-scoped entry identity.
 5. The worker normalizes and sanitizes new or updated entries.
 6. The worker makes the body object and metadata visible through an idempotent coordination
@@ -337,3 +356,4 @@ These are pre-beta design and load-test targets, not a promise of public-service
 - [`0004-image-delivery.md`](decisions/0004-image-delivery.md)
 - [`0005-deployment-platform.md`](decisions/0005-deployment-platform.md)
 - [`0006-static-spa-delivery.md`](decisions/0006-static-spa-delivery.md)
+- [`0007-feed-url-policy.md`](decisions/0007-feed-url-policy.md)
