@@ -105,16 +105,32 @@ A globally shared public RSS or Atom source.
 
 Owns:
 
-- Canonical fetch URL and public site URL
+- Canonical fetch URL, permanent endpoint aliases, and public site URL
 - Display metadata
 - HTTP validators
 - Publication history
 - Adaptive refresh schedule
 - Health and failure state
 
-The model stores no separate feed credentials or custom request headers through beta. Reader does
-not support secret-bearing URLs. Their enforceable classification and canonicalization remain an
-open security and schema decision before shared multi-user ingestion.
+The model stores no separate feed credentials or custom request headers through beta. The complete
+canonical URL, including its path and query, is public endpoint identity. Signed, tokenized, and
+otherwise confidential URLs are unsupported.
+
+Endpoint invariants:
+
+- Each normalized canonical URL or permanent alias has one global Feed owner.
+- A leading chain of HTTP `301` and `308` responses may replace the canonical fetch URL. Preserve
+  prior permanent endpoints as aliases so later submissions resolve to the same Feed.
+- Temporary redirect targets never become aliases.
+- If a permanent redirect reaches another Feed's endpoint, the target Feed survives an idempotent
+  merge. Preserve source-only subscriptions and folder placement. When one user has both
+  subscriptions, retain the target subscription.
+- Do not merge Feeds by response content, parsed entries, title, public site URL, Atom `rel=self`,
+  DNS alias, or temporary redirect target.
+
+Entry collision behavior during a Feed merge follows the feed-scoped identity contract defined with
+the first schema and fixture corpus. The URL contract lives in
+[`0007-feed-url-policy.md`](decisions/0007-feed-url-policy.md).
 
 ### Subscription
 
@@ -295,8 +311,6 @@ bodies, or image files.
 These details remain deferred to schema and fixture design:
 
 - Primary-key representation
-- Feed URL canonicalization rules
-- Secret-bearing URL classification
 - Nested OPML flattening, naming collisions, and duplicate-feed placement
 - Entry identity fallback order
 - Exact content-envelope schema

@@ -29,7 +29,7 @@ discovery. Both paths use the same safe HTTP client and address policy.
 Allow:
 
 - Public `http` and `https` URLs
-- Standards-compliant redirects that remain public
+- At most five standards-compliant redirects that remain public
 - Conditional HTTP requests
 
 Reject:
@@ -41,9 +41,51 @@ Reject:
 - Redirects to a rejected address or scheme
 - Responses above the configured decompressed limit
 
-Validate every DNS result and every redirect target, not only the initial URL. Pair application
-validation with host firewall rules that block metadata addresses and destinations the service never
-needs.
+### Feed URL policy
+
+Use one server-owned canonicalizer for direct feed and website input, OPML feed URLs,
+website-discovery candidates, redirect targets, and stored endpoint lookup. Trim leading and
+trailing ASCII whitespace. Reject embedded whitespace or controls and reject input longer than 4,096
+UTF-8 bytes before or after canonicalization. URLs must be absolute and hierarchical, use `http` or
+`https`, have a valid host and port, and contain no URL user information or IPv6 zone identifier.
+
+Canonicalization lowercases the scheme and DNS host, converts internationalized hostnames with the
+IDNA lookup profile, removes the DNS root dot, serializes IP literals canonically, removes ports 80
+and 443 only for their matching schemes, removes the fragment, and changes an empty path to `/`.
+Preserve the scheme, non-default port, path case and spelling, trailing and repeated slashes, dot
+segments, escaped-octet spelling, and raw query. Query order, duplicate keys, blank values, and an
+explicit empty query remain significant.
+
+Reader cannot reliably distinguish public selectors from secrets in arbitrary paths and queries. It
+therefore treats every accepted path and query as public endpoint identity and does not use
+parameter names or apparent entropy as a secret detector. The add-feed flow warns that Reader may
+store and reuse the complete URL and feed data across accounts that submit the same endpoint. Users
+must not submit signed, tokenized, invitation-only, or otherwise confidential URLs.
+
+Shared Feed records are not publicly discoverable. Return feed URLs only to subscribed users and
+authorized administrators. Keep them out of general logs, telemetry, support diagnostics, and error
+aggregation. These access limits reduce accidental disclosure but do not make capability URLs a
+supported private-feed mechanism. The complete decision lives in
+[`0007-feed-url-policy.md`](decisions/0007-feed-url-policy.md).
+
+### Address and redirect validation
+
+Validate every DNS answer and every redirect target, not only the initial URL. Reject a hostname if
+any answer is non-public. Pin each connection to an address from that validated answer set so DNS
+rebinding cannot trigger an unchecked lookup. Reject ambiguous integer, octal, and hexadecimal IPv4
+host spellings. Pair application validation with host firewall rules that block metadata addresses
+and destinations the service never needs.
+
+Follow only `301`, `302`, `303`, `307`, and `308` responses. Treat every other 3xx response as a
+terminal fetch outcome. Resolve a relative `Location` against the current response URL and rerun
+URL, DNS, and address validation before following it. Fail closed on a redirect loop, a sixth
+redirect, a missing or malformed target, URL user information, an unsupported scheme, or a
+non-public destination. Do not forward origin-specific conditional headers across publisher
+hostnames. Reader never sends user credentials on a redirect.
+
+A leading chain of `301` and `308` responses may update a Feed's canonical fetch endpoint and retain
+the old endpoints as permanent aliases. After the first `302`, `303`, or `307`, that target and all
+later targets in the request are temporary and cannot change Feed identity.
 
 Initial limits:
 
@@ -51,7 +93,7 @@ Initial limits:
 | ------------------------------------------ | -------------------------------------------------------------------- |
 | Feed response                              | 5 MiB after decompression                                            |
 | Concurrent requests per publisher hostname | 2                                                                    |
-| Redirects                                  | Bounded; exact value set with the HTTP client tests                  |
+| Redirects                                  | 5                                                                    |
 | Request duration                           | Bounded; exact connect and total timeouts set with production sizing |
 
 Honor `Retry-After`, send a clear Reader user agent with a contact URL, and apply exponential
@@ -63,10 +105,6 @@ Website discovery accepts only bounded HTML responses. It limits redirects and d
 candidates, and never executes publisher scripts. Set the exact discovery byte and candidate caps
 during implementation, then lock them with tests. These caps cannot exceed the feed-fetch response
 cap.
-
-Reader cannot reliably recognize secret-bearing URL paths and query strings. Before shared
-multi-user ingestion ships, URL canonicalization must define an enforceable policy that prevents
-private capabilities from being treated as globally shareable feeds.
 
 ## Feed HTML pipeline
 
