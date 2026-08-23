@@ -1,8 +1,8 @@
 # Data model
 
 This document defines the conceptual target model and invariants through invitation beta. It is not
-a SQL schema. The first migrations and fixture corpus will determine exact columns, identifiers,
-indexes, and entry-deduplication fallbacks.
+a SQL schema. The first migrations and fixture corpus will determine exact columns, primary-key
+representations, and indexes while preserving the versioned entry and content contracts below.
 
 ## Storage boundaries
 
@@ -128,9 +128,8 @@ Endpoint invariants:
 - Do not merge Feeds by response content, parsed entries, title, public site URL, Atom `rel=self`,
   DNS alias, or temporary redirect target.
 
-Entry collision behavior during a Feed merge follows the feed-scoped identity contract defined with
-the first schema and fixture corpus. The URL contract lives in
-[`0007-feed-url-policy.md`](decisions/0007-feed-url-policy.md).
+Entry collision behavior during a Feed merge follows the feed-scoped identity contract below. The
+URL contract lives in [`0007-feed-url-policy.md`](decisions/0007-feed-url-policy.md).
 
 ### Subscription
 
@@ -155,28 +154,89 @@ Owns:
 - Stable feed-scoped identity
 - Publisher URL
 - Title, author, publication time, and update time
-- Validated lead-image source and content version for list-thumbnail projection
+- Validated lead-image source for list-thumbnail projection
 - Current content-object reference
 - Content version
 
 Publisher updates replace the current ordinary and saved representation. Reader does not expose
 article revision history through beta.
 
-Entry identity must prefer publisher-provided stable IDs and use deterministic feed-scoped
-fallbacks. The exact fallback order remains an implementation decision backed by malformed and
-real-world feed fixtures.
+#### Identity
+
+Each Entry has an immutable versioned identity key unique within its Feed. Identity v1 uses the
+first available source:
+
+1. Opaque, case-sensitive RSS GUID or Atom ID after removal of surrounding XML whitespace
+2. Canonical publisher link
+3. Normalized title plus valid publication time
+4. A source fingerprint over normalized title, authors, valid publication time, and selected
+   feed-provided body
+
+The stored form is `v1:<tier>:sha256:<lowercase-hex>`.
+[ADR 0008](decisions/0008-entry-content-contracts.md) defines exact normalization, hash framing, and
+fallback inputs. Reader rejects an item with no usable identity input. It never uses fetch time,
+item position, or a random value.
+
+A repeated key in one response is one candidate Entry. Reader chooses the greatest valid update
+time, then greatest valid publication time, then the lexicographically smallest normalized
+representation digest. Document order cannot change the winner. Different publisher IDs remain
+different entries even when their links match; changing a publisher ID creates a new Entry.
+
+When a permanent redirect merges Feeds, non-colliding Entries move to the target Feed. For an
+identity collision, the target Entry ID survives and the same duplicate rule selects its current
+representation. Retarget private Entry state and saved references. If one user has both state rows,
+saved is true when either was saved, explicit unread wins over read, reading progress keeps the
+furthest value, and last-opened time keeps the latest value.
+
+#### Content version
+
+Content version is a positive monotonic 64-bit integer. A new Entry starts at 1. For the same
+identity, a changed durable representation increments it by exactly one; an unchanged normalized
+representation keeps the current version and object. The digest covers publisher URL, normalized
+title and authors, valid dates, body source kind, sanitized HTML, plain text, image manifest, and
+lead-image projection. It excludes fetch and XML formatting, unknown fields, storage metadata, and
+compression bytes.
+
+Writers stop at the I-JSON exact-integer limit of 9,007,199,254,740,991 even though PostgreSQL uses
+a signed 64-bit column.
+
+Failed object publication does not make a proposed version current. Versions never decrement or
+repeat, including when a publisher restores earlier content. A pure storage-schema or compression
+migration may preserve the version when browser output and lead image remain identical. Any
+migration that changes durable publisher output increments it.
 
 ### Content object
 
 Metadata for an object in private Object Storage.
 
-The compressed, schema-versioned JSON envelope contains:
+Envelope v1 is RFC 8785 canonical I-JSON compressed with deterministic gzip level 6. The gzip header
+has zero modification time, OS 255, and no name, comment, or extra fields. Objects use media type
+`application/vnd.reader.content+json` and content encoding `gzip`.
 
-- Sanitized feed-provided HTML
-- Plain text derived from the same sanitized body
-- App-owned image placeholders and a normalized public image manifest
-- Normalization metadata needed to render or migrate the envelope
-- Content version and integrity hash
+Every field is required, including empty arrays and null values:
+
+| Field                | Contract                                                                    |
+| -------------------- | --------------------------------------------------------------------------- |
+| `schema_version`     | Positive integer selecting the strict decoder; v1 is `1`                    |
+| `content_version`    | Matches the current Entry content version                                   |
+| `normalizer_version` | Version of deterministic HTML and metadata normalization                    |
+| `sanitizer_version`  | Version of the final Bluemonday policy                                      |
+| `body.source`        | `content`, `summary`, or `empty`                                            |
+| `body.html`          | Final sanitized HTML fragment with typed app-owned placeholders             |
+| `body.text`          | Plain text derived from that fragment and image alt text                    |
+| `images`             | Ordered `{id, source_url, alt}` manifest items                              |
+| `lead_image_id`      | Manifest ID copied into the list projection, or null                        |
+| `integrity`          | `sha256` and lowercase digest of canonical envelope data without this field |
+
+Each accepted body image becomes `<reader-image data-image-id="image-N"></reader-image>` in document
+order. Publisher-supplied versions of that element or attribute are removed before placeholders are
+created. Each placeholder maps to exactly one manifest item. A lead-only item may be the sole
+unreferenced manifest record. Envelope v1 stores no image dimensions. Durable content stores no
+signed imgproxy URLs.
+
+The API bounds decompression, rejects duplicate JSON properties, dispatches by schema version,
+verifies the integrity digest, and validates placeholder IDs, lead-image references, and public
+image URLs before rendering. Unknown or corrupt content fails closed.
 
 After successful processing, the worker discards source feed XML and unsanitized body HTML. Reader
 does not fetch linked article pages. The API generates signed imgproxy URLs from the image manifest
@@ -185,6 +245,12 @@ at response time; they are not durable body data.
 PostgreSQL never exposes a current content-object reference until the object is readable and passes
 its integrity check. Retries are idempotent. Cleanup may remove staged or orphaned objects only
 after the recovery window.
+
+Identity and envelope versions never change meaning. Envelope writers emit only the current version;
+rolling deployments add old-and-new readers before new writes begin. Backfills verify the old
+object, write and verify a new object, and switch the reference through the normal publication
+protocol. They never mutate an object in place. Existing identity keys remain immutable; a future
+identity version requires dual lookup and explicit aliases before writers switch.
 
 Article-list queries use the lead-image projection to generate signed thumbnails without loading
 every body envelope. The projection follows the same image URL validation and content-version rules
@@ -312,8 +378,6 @@ These details remain deferred to schema and fixture design:
 
 - Primary-key representation
 - Nested OPML flattening, naming collisions, and duplicate-feed placement
-- Entry identity fallback order
-- Exact content-envelope schema
 - Exact idempotent protocol that publishes a content reference only after its object is readable
 - Index selection and partition thresholds
 - Audit retention duration

@@ -79,6 +79,87 @@ The fixture corpus includes:
 - Oversized and redirecting responses
 - Image URLs targeting rejected address ranges
 
+### Entry and content fixture contract
+
+Issue #31 creates the redistributable fixture files and issue #7 runs them. The cases and expected
+results below are the versioned contract; replacing a parser, sanitizer, JSON canonicalizer, or gzip
+writer must not change them without a new contract version and migration plan.
+
+#### Identity and duplicates
+
+Every identity fixture asserts the complete `v1:<tier>:sha256:<lowercase-hex>` key, not only whether
+two items compare equal.
+
+- Two Atom entries with one `<id>` and different valid `updated` values collapse to the later
+  revision. Reversing document order produces the same metadata, body, and content version.
+- Two RSS items with one `<guid>` and tied or invalid dates use the lexicographically smallest
+  normalized-representation digest. Reversing order produces the same winner.
+- Missing IDs with links that differ only by normalized scheme or host case and a matching default
+  port collapse. Links with different fragments remain distinct.
+- Distinct publisher IDs with one link remain distinct. One publisher ID with changed link, title,
+  or body updates one Entry.
+- Changing publisher ID A to B creates a new Entry even when the publisher link stays fixed.
+- Missing ID and link with a stable normalized title and publication time updates one Entry when its
+  body changes.
+- An item with no ID, link, or valid title-plus-publication pair uses the source fingerprint. A body
+  change at this tier creates a new Entry.
+- Whitespace-only and over-4,096-byte IDs fall through. Invalid dates do not participate. A fully
+  empty item is rejected rather than receiving fetch-time or position identity.
+- Golden keys cover RSS GUID, Atom ID, relative and fragment links, Unicode NFC and whitespace title
+  normalization, invalid dates, and the source-body fallback.
+
+A Feed-merge fixture contains one colliding publisher key, one source-only key, one target-only key,
+and two distinct IDs sharing one link. The target Entry survives the collision, source-only entries
+move, different keys remain separate, and the duplicate winner is independent of processing order.
+Saved flags combine with OR, explicit unread wins over read, progress keeps the furthest value, and
+last-opened time keeps the latest value.
+
+#### Publisher updates
+
+- First observation starts at content version 1. Replaying the same normalized representation or
+  changing only XML formatting keeps version 1 and does not write another current object.
+- A title, author, valid update time, sanitized body, image source, lead image, or alt-text change
+  moves the version to 2. Replaying that payload remains at 2.
+- Golden tests pin the exact RFC 8785 representation bytes and SHA-256 used for duplicate selection
+  and content-version comparison.
+- A script or stripped publisher attribute change that leaves sanitized output identical does not
+  increment the version.
+- A to B to A produces content versions 1, 2, and 3 rather than reusing 1.
+- A pure envelope-structure or compression migration preserves the version when browser output is
+  identical. A sanitizer migration that changes output increments it.
+- Duplicate candidates and failed publication retries never skip, decrement, or publish an
+  unverifiable version.
+- A synthetic maximum-version case refuses overflow beyond 9,007,199,254,740,991.
+
+#### Envelope and malformed content
+
+A golden envelope combines relative links, repeated image URLs with different alt text, Unicode and
+bidirectional text, and an item-level lead image. It pins all of these outputs:
+
+- Final sanitized HTML and deterministic plain text
+- `content`, `summary`, and `empty` body-source variants
+- Exact `reader-image` tokens, manifest order, IDs, source URLs, alt text, and lead ID
+- RFC 8785 canonical JSON and lowercase integrity SHA-256 with `integrity` omitted from hash input
+- Gzip level 6 bytes with zero modification time, OS 255, and empty optional header fields
+
+Malicious and malformed HTML fixtures remove scripts, styles, event handlers, forms, iframes,
+publisher tracking attributes, injected `reader-image` elements, and injected `data-image-id`
+attributes. Private-literal, user-information, non-HTTP, malformed, and over-4,096-byte image URLs
+do not enter the manifest; escaped non-empty alt text remains in the body and plain text.
+
+Decoder fixtures reject:
+
+- Truncated, invalid, or over-limit gzip data
+- Malformed I-JSON, duplicate properties, unknown required enums, and unsupported schema versions
+- Wrong integrity algorithm or digest
+- Duplicate or missing manifest IDs, unknown or repeated body placeholders, and orphan body items
+- Missing or invalid lead references and rejected manifest source URLs
+
+Compatibility fixtures run an overlap reader against the old and current envelope versions, prove
+that the old reader never receives new-version writes, and backfill ordinary and saved objects. They
+assert that structural rewrites preserve content version while visible output changes increment it,
+and that the old object remains readable through the recovery window.
+
 ### Feed URL fixture contract
 
 The backend URL package and safe HTTP client must implement the following table-driven cases with a
