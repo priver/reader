@@ -169,7 +169,8 @@ Detailed visual design sets exact responsive image widths. The architecture does
 - Saving an entry before ordinary retention expires preserves its body and metadata until no user
   keeps it saved.
 - Unsubscribing removes ordinary history and state but preserves saved items.
-- Publisher changes update an existing article, including content currently saved.
+- Publisher changes update an existing article, including content currently saved, when its
+  feed-scoped identity remains the same. A changed publisher ID is a new article.
 - Account deletion immediately removes identity and private user state.
 - Shared records for public feeds may remain after one account is deleted.
 

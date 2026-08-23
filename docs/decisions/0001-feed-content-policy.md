@@ -13,7 +13,8 @@ reading workflow with content that publishers intentionally include in RSS and A
 
 Through invitation beta, store and render only article HTML supplied by RSS or Atom. Normalize and
 sanitize that HTML in the Go worker. When a feed supplies only an excerpt, show it and provide an
-open-original action.
+open-original action. [ADR 0008](0008-entry-content-contracts.md) defines the stored sanitized
+envelope, image placeholders, and content-version behavior.
 
 After beta, research must revisit the problem before the project creates a linked-page fetcher,
 readability service, extraction contract, extraction job, or extraction-specific storage model.

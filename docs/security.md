@@ -114,17 +114,31 @@ Process in this order:
 
 1. Parse fragment HTML with `golang.org/x/net/html`.
 2. Resolve relative links and images against the entry or feed base URL.
-3. Normalize supported semantic markup.
-4. Replace images with app-owned placeholders and a normalized public image manifest.
-5. Replace approved beta embeds with inert app-owned placeholders.
-6. Apply the strict Bluemonday allowlist as the final transformation.
-7. Derive plain text from sanitized output.
-8. Store only sanitized output and its versioned envelope.
+3. Remove publisher-supplied `reader-image` elements and reserved `data-image-id` attributes.
+4. Normalize supported semantic markup.
+5. Replace accepted images with app-owned placeholders and a normalized public image manifest.
+6. Replace approved beta embeds with inert app-owned placeholders.
+7. Apply the strict Bluemonday allowlist as the final transformation.
+8. Derive plain text from sanitized output and normalized image alt text.
+9. Canonicalize, integrity-hash, and deterministically gzip the versioned envelope.
 
 Bluemonday performs the last transformation that accepts publisher-controlled markup. At response
 time, the API may replace typed app-owned image placeholders with generated `<picture>` markup. That
 expansion accepts only normalized manifest fields and fixed server presets. It never copies
 publisher HTML or attributes into the response.
+
+The only body image token is `<reader-image data-image-id="image-N"></reader-image>`. Number tokens
+in document order and require each ID to resolve to exactly one `{id, source_url, alt}` manifest
+item. The normalizer accepts only absolute public `http` and `https` image URLs of at most 4,096
+UTF-8 bytes without user information. It preserves non-empty escaped alt text when rejecting an
+image. Durable manifests contain no cookies, request headers, signed paths, or unsanitized
+attributes. Envelope v1 does not trust or store publisher-declared image dimensions.
+
+The API bounds gzip decompression before allocation, rejects duplicate JSON properties and
+unsupported schema versions, verifies the envelope SHA-256 over RFC 8785 canonical data, and checks
+placeholder, lead-image, and URL invariants before caching or rendering. An unknown placeholder,
+orphaned body manifest item, invalid lead reference, rejected source URL, or integrity mismatch
+fails closed. It never falls back to rendering stored HTML from an unverifiable envelope.
 
 Alpha allows semantic static HTML and proxied images. The sanitizer removes scripts, forms, inline
 styles, event handlers, iframes, objects, embeds, and publisher tracking markup. In beta, trusted

@@ -14,6 +14,10 @@ Use Managed PostgreSQL for transactional metadata, ownership, sparse user state,
 records. Use private Yandex Object Storage for compressed, versioned sanitized feed-body envelopes.
 Share public feeds and entries globally while keeping subscriptions and state private.
 
+[ADR 0008](0008-entry-content-contracts.md) defines feed-scoped entry identity and the versioned
+envelope format. Object publication and recovery follow a separate coordination protocol because
+PostgreSQL and Object Storage do not share a transaction.
+
 This content bucket is separate from the Object Storage buckets that hold reproducible browser
 release artifacts under [ADR 0006](0006-static-spa-delivery.md).
 

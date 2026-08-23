@@ -10,8 +10,9 @@ cache variants by `Accept`, so one content-negotiated URL can serve an incorrect
 
 ## Decision
 
-Store app-owned image placeholders and a normalized image manifest with sanitized content. When the
-API serves an article or list, expand body placeholders or the lead-image projection to HMAC-signed
+Store app-owned image placeholders and a normalized image manifest with sanitized content using the
+versioned format in [ADR 0008](0008-entry-content-contracts.md). When the API serves an article or
+list, expand body placeholders or the lead-image projection to HMAC-signed
 `https://reader.mprvr.net/images/` URLs using the current key. Keep imgproxy private behind Nginx,
 restrict it to fixed presets, and reject private network sources. Emit explicit AVIF and WebP
 `<picture>` candidates for a small, fixed set of responsive widths chosen during visual design.

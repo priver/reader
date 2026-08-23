@@ -248,10 +248,12 @@ limits live in [`0007-feed-url-policy.md`](decisions/0007-feed-url-policy.md).
 2. River receives a unique feed-refresh job.
 3. The worker fetches the canonical endpoint with conditional headers, redirect reconciliation, and
    safe-network checks.
-4. The worker parses RSS or Atom and resolves feed-scoped entry identity.
-5. The worker normalizes and sanitizes new or updated entries.
-6. The worker makes the body object and metadata visible through an idempotent coordination
-   protocol.
+4. The worker parses RSS or Atom and resolves versioned feed-scoped entry keys.
+5. The worker normalizes and sanitizes candidates, groups duplicate keys with the deterministic
+   representation rule, and selects one candidate per key. An unchanged digest is a no-op; a changed
+   digest receives the next content version.
+6. The worker makes the canonical gzip envelope and metadata visible through an idempotent
+   coordination protocol.
 7. The worker never publishes a content reference before its Object Storage object is readable.
 8. Retries recover incomplete work and asynchronous cleanup removes unreferenced objects.
 9. The worker records outcome, latency, validators, and publication history.
@@ -266,8 +268,10 @@ progress.
 1. The SPA selects an article from a cursor-paginated list.
 2. The SPA applies the read mutation optimistically, and the API persists it as sparse state.
 3. The API resolves the current content object key.
-4. The API serves a hot LRU entry or loads and decompresses the Object Storage envelope.
-5. The API expands typed image placeholders into signed URLs using the current imgproxy key.
+4. The API serves a hot LRU entry or loads, boundedly decompresses, schema-validates, and
+   integrity-checks the Object Storage envelope.
+5. The API validates typed image placeholders against the manifest, then expands them into signed
+   URLs using the current imgproxy key.
 6. The API returns a browser-safe DTO without the internal image manifest.
 7. The DTO ETag covers content version, rendering-schema version, image-preset version, and
    signing-key generation. Any output-affecting change forces a fresh representation.
@@ -357,3 +361,4 @@ These are pre-beta design and load-test targets, not a promise of public-service
 - [`0005-deployment-platform.md`](decisions/0005-deployment-platform.md)
 - [`0006-static-spa-delivery.md`](decisions/0006-static-spa-delivery.md)
 - [`0007-feed-url-policy.md`](decisions/0007-feed-url-policy.md)
+- [`0008-entry-content-contracts.md`](decisions/0008-entry-content-contracts.md)
