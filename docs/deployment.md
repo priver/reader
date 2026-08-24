@@ -106,10 +106,14 @@ OpenTofu owns:
 - Compute VMs, disks, and reserved public addresses
 - Managed PostgreSQL cluster, databases, roles, and backup policy
 - Separate content, end-user release, and admin release Object Storage buckets
-- Content-bucket versioning and lifecycle policy, plus reference-aware browser-release retention
+- Content-bucket versioning with no current-key expiry, at least eight days of noncurrent-version
+  recovery after a delete marker, and one-day incomplete-upload cleanup
+- Content-bucket policy that denies PUT without `If-None-Match: *` and permits the worker to read
+  but not change versioning and lifecycle configuration
 - Service-level restriction of all Object Storage buckets to the Object Storage service connection
 - Endpoint-conditioned, TLS-only, read-only policies for release HTML and asset prefixes
-- Least-privilege API-content, worker-content, deployment-publisher, and release-cleanup identities
+- Least-privilege API-content, worker-content, temporary content-recovery, deployment-publisher, and
+  release-cleanup identities
 - Lockbox containers and IAM bindings, excluding secret values from state where possible
 - Monitoring and alert resources
 - Public DNS, TLS, and Cloudflare resources for `reader.priver.org` and `reader.mprvr.net`
@@ -312,8 +316,19 @@ Managed PostgreSQL:
 Object Storage:
 
 - Enable versioning for content objects.
-- Keep a short recovery window for replaced or deleted bodies.
-- Apply lifecycle deletion only after saved-reference and recovery requirements expire.
+- Never expire a current content key by age. PostgreSQL retention and saved-reference rules are the
+  only authority that may make it an orphan.
+- Keep staged, superseded, and retention-removed objects directly readable for eight days from their
+  PostgreSQL `orphaned_at` time before the worker creates a delete marker.
+- Keep each noncurrent data version for at least eight additional days after its delete marker. Keep
+  the marker while that data version remains recoverable, and abort incomplete multipart uploads
+  after one day as defense in depth.
+- Treat eight days as the minimum derived from the seven-day PostgreSQL point-in-time recovery
+  horizon, eight-hour recovery target, and margin. Increase both object windows before increasing a
+  database recovery target.
+- Halt content publication or cleanup and alert if create-only PUT enforcement is absent, versioning
+  is suspended, current-key expiry appears, or the noncurrent-version window becomes shorter than
+  eight days.
 - Treat browser builds as reproducible release artifacts rather than user data backups.
 - Retain superseded browser manifests for 45 days and always retain active and rollback manifests.
 - Garbage-collect an asset only when no retained manifest references it and its safety delay has
@@ -321,9 +336,20 @@ Object Storage:
 - Run garbage collection under the release-maintenance lock and recompute the retained-manifest
   union immediately before deleting candidates.
 
-For recovery, create a new PostgreSQL cluster and reconnect a disposable application color. Verify
-Object Storage references and Kratos identity mapping, then promote traffic. Run and record a
-complete drill before invitation beta and after material storage changes.
+For recovery, stop publication and cleanup, revoke the old workers' Object Storage writes, prove
+that writes are denied, and wait two minutes for bounded in-flight requests before restoring
+PostgreSQL to a new cluster. Keep workers disabled while a disposable application color verifies
+every current reference by exact object key, version ID, compressed digest, and envelope integrity.
+Use the temporary content-recovery identity to inventory keys and versions forgotten by the selected
+restore point. Import unknown current data keys as unowned quarantine records with a fresh eight-day
+grace; retain unknown noncurrent versions and markers as read-only inventory until their existing
+lifecycle expires. For every restored live reference whose exact version is not storage-current, use
+a controlled `recovery_repair` operation to verify and publish the same envelope at a fresh key,
+preserve its content version and representation digest, and switch the reference atomically. Revoke
+the inventory identity before normal workers start, verify every repaired reference, saved bodies,
+and Kratos identity mapping, then promote traffic. Never run destructive reconciliation against a
+live production bucket while its old database remains authoritative. Run and record a complete drill
+before invitation beta and after material storage changes.
 
 ## Observability
 
@@ -335,6 +361,7 @@ Required signals:
 - HTTP request count, latency, and status class
 - Feed due lag, fetch duration, result class, and publisher throttling
 - River queue depth, age, retries, and failures
+- Content publication counts by state, oldest expired lease, orphan age, and deletion-outbox age
 - PostgreSQL saturation, storage, connections, and slow queries
 - Object Storage latency and error rate
 - Public cookieless-origin latency, status, route class, and Cloudflare and Nginx cache result
@@ -364,6 +391,8 @@ Page or notify on conditions requiring operator action:
 - Kratos authentication or Reader invitation-delivery failure surge
 - imgproxy worker or queue saturation
 - Backup failure
+- Expired content-publication lease, stuck deletion outbox, missing referenced object, integrity
+  mismatch, or content-bucket versioning and lifecycle drift
 - Monthly spend approaching the RUB 10,000 review ceiling
 
 Alerts include a runbook link and release color. They exclude article content, feed URLs, email
@@ -396,6 +425,10 @@ An infrastructure or release change is complete when:
 7. A document from the previous release can load a previously untouched lazy chunk after promotion.
 8. Release HTML and assets reject unsigned reads outside the configured Object Storage service
    connection, and manifests reject unsigned reads everywhere.
-9. Authenticated content, publication, and cleanup operations reject the public endpoint and other
-   service connections.
-10. Deployment and decision documentation matches the released behavior.
+9. Authenticated content, publication, cleanup, and temporary recovery-inventory operations reject
+   the public endpoint and other service connections; the recovery identity is absent outside an
+   approved restore.
+10. Content PUTs require their create-only precondition, current keys have no age expiry, and the
+    configured delete-marker and noncurrent-version behavior preserves both eight-day recovery
+    windows.
+11. Deployment and decision documentation matches the released behavior.

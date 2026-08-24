@@ -100,8 +100,10 @@ fields, version numbers, integrity metadata, compression bytes, and object keys 
 An observation with the same identity and representation digest is a retry or no-op. It keeps the
 current content version and object. Any durable representation change increments the positive 64-bit
 version by exactly one, including metadata-only edits and updates to saved entries. A failed
-publication does not make an unverified version current. A later return to old content still
-receives a new version; Reader never decrements or reuses one.
+publication does not make an unverified version current or consume its proposed number; versions are
+assigned only by the PostgreSQL publication commit in
+[ADR 0009](0009-content-object-publication.md). A later return to old content still receives a new
+assigned version; Reader never decrements or reuses one.
 
 PostgreSQL stores the version in a signed 64-bit integer, but writers stop at the I-JSON
 exact-integer limit of 9,007,199,254,740,991. Reaching that limit fails the update and requires
@@ -179,9 +181,10 @@ and read state.
 Envelope readers dispatch strictly by schema version; writers emit only the current version. Deploy
 readers for both old and new versions before enabling new writes. A backfill verifies the old
 object, writes and verifies a new object, then changes the current reference through the
-content-publication protocol. It does not mutate an object in place. Old decoders and objects remain
-through application, queue, rollback, and recovery overlap. Corrupt or unsupported content fails
-closed and never reaches the browser.
+[content-publication protocol](0009-content-object-publication.md). It does not mutate an object in
+place. After a reference switch, the old object remains directly readable through the eight-day
+orphan grace and recoverable by exact version for at least eight more days after its delete marker.
+Corrupt or unsupported content fails closed and never reaches the browser.
 
 ## Consequences
 
@@ -192,5 +195,5 @@ closed and never reaches the browser.
 - Canonical JSON and deterministic gzip make repeated object writes byte-identical; the internal
   digest verifies the decoded envelope independently of Object Storage transport checksums.
 - The API must support version overlap, and sanitizer migrations may need a bounded object backfill.
-- Issue #26 defines publication and orphan recovery. Issues #7 and #31 implement this contract and
-  its redistributable fixtures.
+- [ADR 0009](0009-content-object-publication.md) defines publication and orphan recovery. Issues #7
+  and #31 implement this contract and its redistributable fixtures.

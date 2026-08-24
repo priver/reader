@@ -6,17 +6,19 @@ representations, and indexes while preserving the versioned entry and content co
 
 ## Storage boundaries
 
-| Store                           | Owns                                                                                                                                   |
-| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| Application PostgreSQL database | Users, invitation requests, invitations, folders, feeds, subscriptions, entries, sparse user state, jobs, fetch history, audit records |
-| Kratos PostgreSQL database      | Identities, credentials, sessions, verification, recovery, social login                                                                |
-| Private content Object Storage  | Versioned compressed envelopes for sanitized feed bodies                                                                               |
-| Private browser-release buckets | Versioned HTML, release manifests, and content-addressed browser assets                                                                |
-| Nginx disk cache                | Rebuildable processed image responses; never authoritative data                                                                        |
+| Store                           | Owns                                                                                                                                                                                                                      |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Application PostgreSQL database | Users, invitation requests, invitations, folders, feeds, subscriptions, entries, sparse user state, jobs, fetch history, audit records, content publication intents, references, deletion outbox, and recovery quarantine |
+| Kratos PostgreSQL database      | Identities, credentials, sessions, verification, recovery, social login                                                                                                                                                   |
+| Private content Object Storage  | Immutable versioned compressed envelopes, delete markers, and recoverable noncurrent versions                                                                                                                             |
+| Private browser-release buckets | Versioned HTML, release manifests, and content-addressed browser assets                                                                                                                                                   |
+| Nginx disk cache                | Rebuildable processed image responses; never authoritative data                                                                                                                                                           |
 
 Application and River tables share one database and transaction boundary. Kratos uses a distinct
 database and role in the same initial managed cluster. Application code does not query Kratos tables
-directly.
+directly. PostgreSQL alone decides whether an Entry and content-object reference are current or safe
+to delete. Object Storage retains opaque bytes and version history but knows nothing about Entries,
+saves, or retention eligibility.
 
 Browser releases are deployment artifacts, not application records or user data. Their 45-day
 stale-document retention and reference-aware cleanup policy live in
@@ -37,7 +39,8 @@ erDiagram
   FOLDER ||--o{ SUBSCRIPTION : contains
   FEED ||--o{ SUBSCRIPTION : followed_by
   FEED ||--o{ ENTRY : publishes
-  ENTRY ||--o| CONTENT_OBJECT : has_current
+  ENTRY ||--o{ CONTENT_OBJECT : owns_attempts
+  ENTRY o|--o| CONTENT_OBJECT : references_current
   USER ||--o{ ENTRY_STATE : records
   ENTRY ||--o{ ENTRY_STATE : receives
   USER ||--o{ ADMIN_AUDIT : performs
@@ -157,6 +160,7 @@ Owns:
 - Validated lead-image source for list-thumbnail projection
 - Current content-object reference
 - Content version
+- Current normalized-representation digest
 
 Publisher updates replace the current ordinary and saved representation. Reader does not expose
 article revision history through beta.
@@ -200,14 +204,20 @@ compression bytes.
 Writers stop at the I-JSON exact-integer limit of 9,007,199,254,740,991 even though PostgreSQL uses
 a signed 64-bit column.
 
-Failed object publication does not make a proposed version current. Versions never decrement or
-repeat, including when a publisher restores earlier content. A pure storage-schema or compression
-migration may preserve the version when browser output and lead image remain identical. Any
-migration that changes durable publisher output increments it.
+Failed object publication does not make a proposed version current. A version proposed by an intent
+is assigned only when PostgreSQL publishes it; abandoning the intent does not consume that number.
+The next successful publisher change is therefore exactly current version plus one. Assigned
+versions never decrement or repeat, including when a publisher restores earlier content. A pure
+storage-schema or compression migration may preserve the version when browser output and lead image
+remain identical. Any migration that changes durable publisher output increments it.
 
 ### Content object
 
-Metadata for an object in private Object Storage.
+PostgreSQL metadata for an immutable envelope in private Object Storage. One object belongs to one
+Entry and one publication intent; Reader does not deduplicate objects between Entries. Its opaque
+key is `content/objects/<random-object-id>.json.gz`. A retry of one intent reuses that key, while a
+different intent always receives a new key. Keys never contain feed, Entry, user, or
+proposed-version identity and are never reused after deletion.
 
 Envelope v1 is RFC 8785 canonical I-JSON compressed with deterministic gzip level 6. The gzip header
 has zero modification time, OS 255, and no name, comment, or extra fields. Objects use media type
@@ -242,15 +252,114 @@ After successful processing, the worker discards source feed XML and unsanitized
 does not fetch linked article pages. The API generates signed imgproxy URLs from the image manifest
 at response time; they are not durable body data.
 
-PostgreSQL never exposes a current content-object reference until the object is readable and passes
-its integrity check. Retries are idempotent. Cleanup may remove staged or orphaned objects only
-after the recovery window.
+#### Publication state
+
+Before any Object Storage request, PostgreSQL commits a Content object intent containing:
+
+- Owning Entry and immutable key
+- Base current-object ID, content version, and representation digest
+- Publisher-update, storage-rewrite, or recovery-repair operation kind; target format; proposed
+  version; candidate digest; and pending typed Entry metadata
+- Expected compressed length and SHA-256, envelope integrity digest, and format versions
+- Exact Object Storage version ID once an upload is found
+- State and transition times
+- Monotonic publication fence, 15-minute lease, orphan time, and cleanup deadline
+
+Pending typed metadata is sufficient to combine the uploaded body with its title, authors, dates,
+publisher URL, and projections after a crash. PostgreSQL does not stage another copy of body HTML or
+envelope bytes. An internal Entry shell may reserve a new feed-scoped identity, but every product
+query requires a current-object reference, so the shell is not visible.
+
+Content object state moves from `staged` to `verified` to `current` to `orphaned`. A staged or
+verified attempt may instead become orphaned. At most one staged or verified intent exists per
+Entry. Both the Content object's owning-Entry foreign key and `Entry.current_content_object_id` are
+restrictive and never cascade. The Entry shell remains until all owned Content object rows move to
+the deletion outbox. Current Entry metadata, content version, representation digest, and object
+reference always change in one PostgreSQL transaction.
+
+#### Publication protocol
+
+1. The worker creates deterministic envelope bytes and their expected digests before opening the
+   staging transaction.
+2. It locks the Entry and returns a no-op for a publisher candidate with the current digest. An
+   explicit storage rewrite continues when its target format or compressed digest differs. The
+   `recovery_repair` operation continues when a restored exact version is not storage-current, even
+   when format and bytes are unchanged. The worker recovers an intent only when operation kind,
+   candidate, target format, and compressed digest all match, or waits for a different intent's live
+   lease. After a lease expires, takeover increments its fence; only the current fence may change
+   state.
+3. The worker records and commits the intent before conditionally creating its random object key. A
+   fresh read-only policy check must pass, and bucket policy denies PUT without `If-None-Match: *`.
+   An unknown transaction result is resolved by the Entry, base, operation, target, candidate
+   digest, and compressed digest before upload. No PostgreSQL transaction stays open during a
+   storage request.
+4. The lease holder performs a full GET after PUT, including when the PUT result was ambiguous or
+   the key already existed. It verifies the exact version ID, compressed length and SHA-256, strict
+   envelope decoder and internal integrity checks, proposed content version, and representation
+   digest reconstructed with pending metadata. HEAD and ETag checks cannot mark an object verified.
+5. The publication transaction checks the intent fence, persisted feed-refresh generation, and Entry
+   base object, version, and digest. It atomically installs the proposed Entry data and marks the
+   new object current. A former current object becomes orphaned in the same transaction. A
+   `recovery_repair` instead moves its restored noncurrent base metadata to recovery quarantine
+   under the existing lifecycle deadline.
+
+The final PostgreSQL commit is the only publication point. A retry after upload repeats
+verification; a retry after an ambiguous commit reads the Entry and treats a matching object and
+digest as success. A changed base, stale feed generation, missing Entry, unexpected object, or
+failed verification can only orphan the intent. It cannot expose or overwrite its bytes.
+Storage-only backfills and recovery repairs use explicit operation kinds and follow the same
+base-object compare-and-swap.
+
+Publication leases last 15 minutes, heartbeat once per minute, and fence every state transition. An
+Object Storage request is bounded to two minutes and cannot start without that much lease time
+remaining. A stale holder may finish writing its intent's unique key, but it cannot publish after a
+takeover.
+
+#### Orphan cleanup
+
+Abandonment, replacement, and retention set `orphaned_at` and `gc_not_before` using the PostgreSQL
+clock. The object remains directly readable for eight days. After that grace, cleanup may claim it
+only if no current Entry or explicit migration/recovery pin references it, no lease is live, the
+lease plus the two-minute request bound has elapsed, and content-bucket versioning and lifecycle
+policy pass a fresh read-only health check. Every supported pin uses a restrictive foreign key.
+
+The claim transaction deletes the eligible Content object record into a deletion outbox. The
+restrictive current-reference foreign key makes this atomic with respect to concurrent publication:
+a committed reference prevents the claim, while a committed claim makes a later reference fail. The
+outbox keeps the key, optional exact data-version ID, digests, terminal disposition, delete result,
+and recovery expiry.
+
+After waiting out any last request bound, cleanup checks the current key. Absence without a current
+delete marker records `never_uploaded` and sends no delete. If the expected version is current,
+cleanup persists the request start and sends `DeleteObject` without a version ID. If a delete marker
+is already current, it records that marker and sends no second delete; a different current data
+version is quarantined and alerted. Failed and ambiguous requests return to the current-key check,
+so cleanup sends another delete only when the expected data version is still current. Exact-version
+read-back confirms that the original bytes remain recoverable. The delete-attempt start plus eight
+days is the conservative recovery deadline; a known failed attempt retried later extends it.
+
+Current keys have no age-based Object Storage expiry. Lifecycle policy keeps the noncurrent data
+version for at least eight days after its delete marker and keeps the marker while that data version
+is recoverable. Routine workers use exact PostgreSQL keys and never list the bucket. After a
+PostgreSQL point-in-time restore, a separate recovery-quarantine record can hold an unknown key and
+version without an owning Entry or pending metadata. It can never be published. Unknown current data
+keys receive a new eight-day grace; unknown noncurrent versions and markers remain inventory records
+until their existing lifecycle expires.
+
+A restored Entry cannot continue to reference a data version that is already noncurrent in Object
+Storage because its original lifecycle may purge it. Before promotion, recovery rewrites every such
+verified envelope to a fresh random key, preserves its content version and representation digest,
+and atomically switches the Entry through a distinct `recovery_repair` intent. The old Content
+object metadata moves to recovery quarantine with its existing lifecycle instead of receiving a new
+grace. Every repaired reference must be storage-current. The complete rules live in
+[`0009-content-object-publication.md`](decisions/0009-content-object-publication.md).
 
 Identity and envelope versions never change meaning. Envelope writers emit only the current version;
 rolling deployments add old-and-new readers before new writes begin. Backfills verify the old
 object, write and verify a new object, and switch the reference through the normal publication
-protocol. They never mutate an object in place. Existing identity keys remain immutable; a future
-identity version requires dual lookup and explicit aliases before writers switch.
+protocol in [ADR 0009](decisions/0009-content-object-publication.md). They never mutate an object in
+place. Existing identity keys remain immutable; a future identity version requires dual lookup and
+explicit aliases before writers switch.
 
 Article-list queries use the lead-image projection to generate signed thumbnails without loading
 every body envelope. The projection follows the same image URL validation and content-version rules
@@ -327,6 +436,8 @@ a second folder-level state model.
 | Ordinary entry metadata  | 90 days                                              |
 | Saved body and metadata  | Until no user keeps the entry saved                  |
 | Read/progress exceptions | While required by retained entries and product state |
+| Orphaned object key      | Eight readable days from `orphaned_at`               |
+| Deleted object version   | Eight more days after its delete marker              |
 
 Image-cache policy lives in [`security.md`](security.md). Backup and recovery policy lives in
 [`deployment.md`](deployment.md).
@@ -336,9 +447,16 @@ partitioning only after measured query or cleanup behavior justifies it.
 
 Retention removes ordinary metadata and its sanitized body together from the user's perspective. It
 must not leave a bodyless ordinary entry visible through beta. Deleting expired ordinary content
-must not remove an object still referenced by a saved item. Object Storage versioning provides a
-short recovery window; lifecycle rules remove superseded or unreferenced versions after the recovery
-period.
+must not remove an object still referenced by a saved item. The retention transaction checks saved
+references before removing the Entry and current-object reference, then starts the object's
+eight-day readable orphan grace. Object cleanup does not repeat saved-state logic: the restrictive
+Entry reference protects every retained ordinary or saved body. A later delete marker starts the
+additional eight-day Object Storage version-recovery window.
+
+PostgreSQL retains a non-queryable Entry shell containing only opaque identity and coordination
+fields until its publication intents and objects move to the deletion outbox. The ownership foreign
+key is restrictive; retention never cascade-deletes Content object rows. The shell is not retained
+ordinary metadata, cannot appear in product queries, and cannot keep an object current by itself.
 
 ## Unsubscribe
 
@@ -348,7 +466,8 @@ When a user unsubscribes:
 - Preserve saved state and the metadata/content required to render saved items.
 - Preserve the global feed and entries while other subscribers or retained saved items reference
   them.
-- Garbage-collect globally orphaned data asynchronously after retention and recovery windows.
+- Garbage-collect globally orphaned data asynchronously after ordinary retention, then apply the
+  eight-day readable orphan grace and additional eight-day deleted-version recovery window.
 
 ## Account deletion
 
@@ -378,7 +497,6 @@ These details remain deferred to schema and fixture design:
 
 - Primary-key representation
 - Nested OPML flattening, naming collisions, and duplicate-feed placement
-- Exact idempotent protocol that publishes a content reference only after its object is readable
 - Index selection and partition thresholds
 - Audit retention duration
 - Undo representation and expiry

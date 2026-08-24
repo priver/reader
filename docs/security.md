@@ -17,6 +17,7 @@ Primary boundaries:
 - Go normalizer to stored article HTML
 - Public `reader.mprvr.net/images/` request to Nginx and private imgproxy
 - Application API and worker to private Object Storage
+- Temporary disaster-recovery inventory access to private content Object Storage
 - Nginx through the VPC Object Storage service connection to browser-release storage
 - Reader session to private admin authorization
 - Application telemetry to Yandex, the Sentry Free plan, and PostHog
@@ -121,6 +122,8 @@ Process in this order:
 7. Apply the strict Bluemonday allowlist as the final transformation.
 8. Derive plain text from sanitized output and normalized image alt text.
 9. Canonicalize, integrity-hash, and deterministically gzip the versioned envelope.
+10. Publish only after the worker reads the stored version back through the private endpoint and
+    completes the strict checks below.
 
 Bluemonday performs the last transformation that accepts publisher-controlled markup. At response
 time, the API may replace typed app-owned image placeholders with generated `<picture>` markup. That
@@ -139,6 +142,11 @@ unsupported schema versions, verifies the envelope SHA-256 over RFC 8785 canonic
 placeholder, lead-image, and URL invariants before caching or rendering. An unknown placeholder,
 orphaned body manifest item, invalid lead reference, rejected source URL, or integrity mismatch
 fails closed. It never falls back to rendering stored HTML from an unverifiable envelope.
+
+The worker uses the same strict decoder on a full Object Storage GET before publication. It also
+checks the compressed length and SHA-256, exact Object Storage version ID, proposed content version,
+and normalized-representation digest reconstructed with staged Entry metadata. A successful PUT,
+HEAD, ETag, or provider checksum does not authorize publication.
 
 Alpha allows semantic static HTML and proxied images. The sanitizer removes scripts, forms, inline
 styles, event handlers, iframes, objects, embeds, and publisher tracking markup. In beta, trusted
@@ -182,7 +190,7 @@ permissive development policy into production.
 - Expose both admin hostnames only on the private Nginx listener reached through Yandex Bastion.
   Cloudflare does not proxy either hostname.
 
-## Browser release assets
+## Object Storage authorization
 
 - Restrict the content, end-user release, and admin release buckets at the service level to the
   configured VPC Object Storage service connection. Disable public-network and management-console
@@ -191,16 +199,57 @@ permissive development policy into production.
 Apply these authenticated permissions. Condition every permission on TLS and the configured service
 connection. Deny every action not listed.
 
-| Identity          | Object scope                       | Allowed S3 permissions                                                                 |
-| ----------------- | ---------------------------------- | -------------------------------------------------------------------------------------- |
-| API content       | Content-envelope prefix            | `s3:GetObject`                                                                         |
-| Worker content    | Content-envelope prefix            | `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`                                      |
-| Release publisher | HTML, asset, and manifest prefixes | `s3:GetObject`, `s3:PutObject`                                                         |
-| Release cleanup   | HTML, asset, and manifest prefixes | Prefix-scoped `s3:ListBucket`, manifest `s3:GetObject`, eligible-key `s3:DeleteObject` |
-| Nginx             | No authenticated scope             | None                                                                                   |
+| Identity          | Object scope                       | Allowed S3 permissions                                                                                                                                               |
+| ----------------- | ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| API content       | Content-envelope prefix            | `s3:GetObject`, `s3:GetObjectVersion`                                                                                                                                |
+| Worker content    | Content prefix and bucket config   | `s3:GetObject`, `s3:GetObjectVersion`, conditional `s3:PutObject`, `s3:DeleteObject`, `s3:GetBucketPolicy`, `s3:GetBucketVersioning`, `s3:GetLifecycleConfiguration` |
+| Content recovery  | Content-envelope prefix            | `s3:ListBucket`, `s3:ListBucketVersions`, `s3:GetObject`, `s3:GetObjectVersion`                                                                                      |
+| Release publisher | HTML, asset, and manifest prefixes | `s3:GetObject`, `s3:PutObject`                                                                                                                                       |
+| Release cleanup   | HTML, asset, and manifest prefixes | Prefix-scoped `s3:ListBucket`, manifest `s3:GetObject`, eligible-key `s3:DeleteObject`                                                                               |
+| Nginx             | No authenticated scope             | None                                                                                                                                                                 |
 
-- The API and worker cannot list buckets or change bucket policy, lifecycle, versioning, or other
-  configuration. Content-bucket versioning provides recovery from an erroneous worker deletion.
+### Content objects
+
+- The API reads only the exact key and version ID referenced by PostgreSQL. It cannot list, create,
+  overwrite, delete, or administer content storage.
+- The worker commits a PostgreSQL publication intent before any upload. It creates one random key
+  conditionally, never overwrites an existing key, and resolves every ambiguous result with a full
+  verified GET. Bucket policy denies content `PutObject` unless the request carries
+  `If-None-Match: *`; application discipline alone is insufficient. A mismatch is quarantined and
+  alerted rather than repaired in place.
+- Routine publication and cleanup use exact PostgreSQL keys. The worker cannot list buckets or
+  versions, permanently delete a data version, suspend versioning, change lifecycle policy, or
+  administer the bucket. It may read bucket policy, versioning, and lifecycle configuration so
+  publication and cleanup can fail closed on drift. Cleanup acts only after PostgreSQL has
+  atomically moved the orphan into its deletion outbox.
+- Content-bucket versioning is mandatory. Current keys have no age-based expiry. After the eight-day
+  readable orphan grace, a cleanup delete marker hides the key while its data version remains
+  recoverable for at least eight additional days. Halt cleanup when versioning or lifecycle
+  configuration drifts.
+- Cleanup checks current-key state before every mutation. A never-uploaded key receives no delete
+  marker. An expected current data version receives `DeleteObject` without a version ID; an existing
+  current delete marker receives no second delete; and any other current version is quarantined.
+- The content-recovery identity exists only for an approved PostgreSQL restore. It can inventory the
+  opaque content prefix and read exact versions but cannot write, delete, or administer objects. Run
+  it from an ephemeral private workflow. Unknown current data keys receive unowned quarantine
+  records and a new eight-day grace; unknown noncurrent versions and delete markers remain read-only
+  inventory until their existing lifecycle expires.
+- A restored live reference hidden by a marker or superseding version is not safe merely because an
+  exact-version GET succeeds. The controlled `recovery_repair` operation uses the normal worker's
+  create-only permission to verify and republish those bytes under a fresh key, preserving content
+  version and representation digest. It grants no delete-version permission.
+- During disaster recovery, revoke old worker writes, prove denial, and wait out the two-minute
+  object-request bound before inventory begins. Revoke the recovery identity before application
+  workers restart. A PostgreSQL fence in an abandoned cluster cannot stop that cluster's credentials
+  from creating Object Storage objects.
+
+The API requests exact versions but still verifies envelope integrity on every cache miss. Exact
+version selection keeps a delete marker or unrelated latest version from changing the bytes attached
+to a PostgreSQL reference; it is not a substitute for application validation. The complete state,
+lease, retry, and deletion protocol is [ADR 0009](decisions/0009-content-object-publication.md).
+
+### Browser release assets
+
 - Allow anonymous `s3:GetObject` only for release HTML and asset object prefixes when
   `yc:private-endpoint-id` matches that service connection and `aws:SecureTransport` is true. Grant
   no anonymous list, write, delete, policy, or configuration operation. Deny unsigned reads of
@@ -358,6 +407,7 @@ Yandex Lockbox is authoritative for production secrets, including:
 - API and worker Object Storage credentials when process-scoped workload identities are not
   available
 - Browser-release publishing and cleanup credentials when workload identity is not available
+- Temporary content-recovery inventory credentials when workload identity is not available
 - Sentry and PostHog keys where needed server-side
 
 Do not grant content-object permissions to a VM-wide metadata identity available to every container.
@@ -411,9 +461,12 @@ Security-sensitive work is complete only when:
    between `/assets/` and `/images/`.
 7. Infrastructure tests verify unsigned release HTML and asset reads work only through the
    configured VPC service connection; manifests and every other key deny unsigned reads.
-8. Infrastructure tests verify content, publication, and cleanup operations require their scoped
-   identities and the configured service connection, and that Nginx cannot obtain those identities.
-9. Direct origin requests to public application, asset, and image routes fail without Cloudflare
-   origin authentication.
-10. Logs, Sentry, and analytics samples contain no prohibited fields.
-11. The production container scan and `govulncheck` pass, or the change documents the accepted risk.
+8. Infrastructure tests verify bucket-policy denial of unconditional content writes, conditional
+   creation, exact-version read-back, single delete-marker convergence, configuration reads, and
+   recovery-window lifecycle behavior through the configured service connection.
+9. Infrastructure tests verify API, worker, temporary content-recovery, browser-publication, and
+   cleanup permissions remain scoped as documented and that Nginx cannot obtain those identities.
+10. Direct origin requests to public application, asset, and image routes fail without Cloudflare
+    origin authentication.
+11. Logs, Sentry, and analytics samples contain no prohibited fields.
+12. The production container scan and `govulncheck` pass, or the change documents the accepted risk.
