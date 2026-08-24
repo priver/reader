@@ -114,13 +114,14 @@ drive inventory reconciliation and eventual cleanup.
    the intent, alerts, and never overwrites or publishes that object. If no object is present, the
    upload remains retryable while its lease is live. A valid object is marked `verified` only while
    the worker holds the current publication fence.
-7. In one final PostgreSQL transaction, the worker locks the Entry and verified object, checks its
-   lease and fence, checks the persisted feed-refresh generation, and compares the Entry's current
-   object, version, and digest with the captured base. It atomically installs all proposed metadata,
-   content version, representation digest, and current-object reference; marks the new object
-   `current`; and makes the former object `orphaned` with an eight-day grace. For a recovery repair,
-   that transaction instead moves the restored noncurrent base into recovery quarantine under its
-   existing lifecycle deadline.
+7. In one final PostgreSQL transaction, the worker locks the Feed first when publishing a new Entry,
+   then locks the Entry and verified object, checks its lease and fence, checks the persisted
+   feed-refresh generation, and compares the Entry's current object, version, and digest with the
+   captured base. A new Entry receives the next Feed observation position in this transaction. The
+   worker atomically installs all proposed metadata, content version, representation digest, and
+   current-object reference; marks the new object `current`; and makes the former object `orphaned`
+   with an eight-day grace. For a recovery repair, that transaction instead moves the restored
+   noncurrent base into recovery quarantine under its existing lifecycle deadline.
 8. That final commit is the only publication point. A new Entry becomes queryable there. No
    PostgreSQL transaction remains open during an Object Storage request.
 
@@ -152,8 +153,10 @@ Recovery uses the exact intent and key:
 
 A recovery worker can finish a verified intent without the source XML because PostgreSQL retains the
 pending Entry metadata and Object Storage retains the body. A staged intent with no object and no
-reproducible bytes is orphaned rather than guessed. Feed merges and retention fence affected
-refreshes and intents while holding the relevant Entry locks.
+reproducible bytes is orphaned rather than guessed. Feed merges first lock affected Feeds in stable
+ID order and commit a merge fence. Their final transaction locks Feeds before Entries in stable ID
+order and fences affected refreshes and intents. Publication that observes a merge fence defers
+without changing its intent's base.
 
 ### Orphan cleanup and deletion recovery
 

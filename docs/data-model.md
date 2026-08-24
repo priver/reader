@@ -6,13 +6,13 @@ representations, and indexes while preserving the versioned entry and content co
 
 ## Storage boundaries
 
-| Store                           | Owns                                                                                                                                                                                                                      |
-| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Application PostgreSQL database | Users, invitation requests, invitations, folders, feeds, subscriptions, entries, sparse user state, jobs, fetch history, audit records, content publication intents, references, deletion outbox, and recovery quarantine |
-| Kratos PostgreSQL database      | Identities, credentials, sessions, verification, recovery, social login                                                                                                                                                   |
-| Private content Object Storage  | Immutable versioned compressed envelopes, delete markers, and recoverable noncurrent versions                                                                                                                             |
-| Private browser-release buckets | Versioned HTML, release manifests, and content-addressed browser assets                                                                                                                                                   |
-| Nginx disk cache                | Rebuildable processed image responses; never authoritative data                                                                                                                                                           |
+| Store                           | Owns                                                                                                                                                                                                                                                                |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Application PostgreSQL database | Users, invitation requests, invitations, folders, feeds, subscriptions, entries, sparse user state, OPML import runs, bulk-read undo context, jobs, fetch history, audit records, content publication intents, references, deletion outbox, and recovery quarantine |
+| Kratos PostgreSQL database      | Identities, credentials, sessions, verification, recovery, social login                                                                                                                                                                                             |
+| Private content Object Storage  | Immutable versioned compressed envelopes, delete markers, and recoverable noncurrent versions                                                                                                                                                                       |
+| Private browser-release buckets | Versioned HTML, release manifests, and content-addressed browser assets                                                                                                                                                                                             |
+| Nginx disk cache                | Rebuildable processed image responses; never authoritative data                                                                                                                                                                                                     |
 
 Application and River tables share one database and transaction boundary. Kratos uses a distinct
 database and role in the same initial managed cluster. Application code does not query Kratos tables
@@ -98,9 +98,92 @@ Invariants:
 
 ### Folder
 
-A user-owned named group. Each subscription belongs to at most one folder. OPML import maps outline
-information into this flat model. The import design will define how to handle nested paths,
-duplicate placements, and naming collisions.
+A user-owned named group. Each subscription belongs to at most one folder. Folder names are unique
+per user after trimming leading and trailing Unicode whitespace, collapsing each internal Unicode
+whitespace run to one ASCII space, and normalizing to NFC. A normalized name must be nonempty and at
+most 255 UTF-8 bytes. Comparison remains case-sensitive.
+
+#### OPML path flattening
+
+Reader walks `<outline>` start elements below `<body>` in depth-first document order. An outline
+with a nonempty `xmlUrl` after ASCII-whitespace trimming is a feed occurrence, even when its URL
+later fails validation. Its own `text` or `title` never contributes a folder component. Other
+ancestor outlines contribute the first nonempty normalized value of `text` then `title`; empty
+components are skipped. Unnamed wrapper outlines therefore do not create folders.
+
+Reader joins components with the three-character separator space, slash, space. A feed with no named
+ancestor remains unfiled. Equal normalized component arrays are one source path. Paths that become
+equal through documented whitespace or Unicode normalization intentionally coalesce.
+
+Distinct component arrays can flatten to the same base, such as nested `Tech` then `Security` and
+one literal `Tech / Security` component. Process new Feed groups by winning occurrence. For each
+path, start with its base; if another path admitted by this run already claimed that name, append
+` (2)` to the original base, then try ` (3)` and higher until the name is unclaimed. Thus a literal
+`Tech / Security (2)` that follows a generated `Tech / Security (2)` receives
+`Tech / Security (2) (2)`. An existing folder with the selected normalized name is reused rather
+than causing another suffix.
+
+Names are never truncated. A selected name over 255 UTF-8 bytes is an item error and does not
+consume a subscription slot or claim the name; processing continues with the next Feed group. Name
+claims are immutable for retries of one import run. A later run recomputes names for subscriptions
+it can newly add against its own source order and current folders; Reader does not retain OPML
+source-path identity after a run. Existing subscriptions still never move.
+
+#### OPML import run
+
+An accepted upload produces an immutable import run and ordered candidate plan. The parser accepts
+one uncompressed XML document with one unqualified `<opml>` root and exactly one direct `<body>`,
+rejects DTDs, custom entity declarations, and XInclude, and applies the limits in
+[`security.md`](security.md#opml-import). Malformed XML, an invalid root or body, or any
+document-level limit violation rejects the whole upload before folder or subscription changes.
+Unknown elements and attributes are ignored within those limits.
+
+A syntactically valid document can complete partially. Each feed occurrence passes through the same
+4,096-byte URL canonicalizer, safe HTTP client, redirect policy, and feed parser as direct addition.
+Invalid or blocked URLs, authoritative DNS absence, redirect-policy failures, TLS certificate
+failures, response-size limit failures, HTTP `4xx` other than `408`, `425`, and `429`, and a
+successful response that is not a valid RSS or Atom feed are permanent item errors. Temporary DNS
+and transport failures, timeouts, HTTP `408`, `425`, `429`, and `5xx` receive exponential backoff
+and at most five total attempts.
+
+No attempt may start unless the PostgreSQL clock is strictly before the run's acceptance time plus
+24 hours. A valid `Retry-After` selects the later of publisher delay and normal backoff; an invalid
+value is ignored. If the selected next-attempt time is at or after the deadline, the item becomes
+terminal at the deadline. An attempt started before the deadline may finish within its normal
+request timeout. One user may have only one resolving or finalizing import run, and a new upload
+cannot replace it.
+
+Finalization waits until each candidate has resolved or reached a terminal outcome, then applies the
+user-visible result in one PostgreSQL transaction:
+
+1. Collapse successfully resolved occurrences by final Feed identity, including permanent aliases
+   and Feed merges. Raw URL equality is not the deduplication boundary.
+2. Select the earliest successfully resolved occurrence in document order for each Feed. Its
+   flattened path wins even when it is unfiled; job completion order cannot affect placement.
+3. Report `already_subscribed` and leave the existing folder placement, initial watermark, and
+   private Entry state unchanged.
+4. Process remaining Feed groups by winning occurrence. While a slot remains, derive and validate
+   its folder name against names claimed by earlier admitted groups. A `folder_name` error neither
+   claims the name nor consumes a slot, so the next valid group can use that slot. Admit each valid
+   group until the user's 500-subscription limit is reached; report later groups as
+   `subscription_limit` without deriving or creating a folder.
+5. Create or reuse only folders referenced by admitted groups. Set each new subscription's initial
+   watermark to the latest Entry observation available at finalization, so existing entries begin
+   read and later observations begin unread.
+
+The result counts source occurrences separately as permanently failed, retry-exhausted, resolved
+winner, or resolved duplicate. It also counts resolved Feed groups as imported,
+`already_subscribed`, `folder_name`, or `subscription_limit`. Resolved duplicates and
+`already_subscribed` are non-error outcomes. Each failed occurrence gets an error anchored to its
+source ordinal; each Feed-level `folder_name` or `subscription_limit` error is anchored to the
+winning occurrence. Return at most the first 100 error details in that order while retaining
+complete aggregate counts.
+
+The import run ID fences worker retries. Repeating resolution or an ambiguous finalization commit
+reads the persisted run and converges on the same result; it cannot consume another subscription
+slot or append a suffix to a folder. Uploading the same file as a new run is duplicate-safe, not a
+no-op guarantee: existing subscriptions and folders are not duplicated, but a previously failed item
+can succeed and capacity or current folders can differ in the new bounded attempt window.
 
 ### Feed
 
@@ -157,6 +240,7 @@ Owns:
 - Stable feed-scoped identity
 - Publisher URL
 - Title, author, publication time, and update time
+- Feed-local observation position
 - Validated lead-image source for list-thumbnail projection
 - Current content-object reference
 - Content version
@@ -189,8 +273,29 @@ different entries even when their links match; changing a publisher ID creates a
 When a permanent redirect merges Feeds, non-colliding Entries move to the target Feed. For an
 identity collision, the target Entry ID survives and the same duplicate rule selects its current
 representation. Retarget private Entry state and saved references. If one user has both state rows,
-saved is true when either was saved, explicit unread wins over read, reading progress keeps the
-furthest value, and last-opened time keeps the latest value.
+saved is true when either was saved, resolved visible unread wins over visible read, reading
+progress keeps the furthest value, and last-opened time keeps the latest value. Read resolution
+includes both watermarks and explicit markers, so an implied unread value still wins an implied or
+explicit read value.
+
+A Feed merge first locks source and target Feeds in ascending ID order and commits a merge fence.
+While fenced, new Entry publication, import finalization, and bulk mark-read snapshots touching
+either Feed defer. The merge can then wait without holding row locks until every affected undo
+context is undone, superseded, or expired; because no new context can start, this wait is at most 30
+seconds from the fence. The final merge transaction locks both Feeds in ascending ID order before
+locking affected Entries in ascending ID order and fences their refreshes and publication intents.
+
+That transaction preserves each affected user's visible read state for Entries from every Feed they
+followed before the merge; Entries gained from a Feed they did not follow begin read. It advances
+the surviving subscription watermark through every Entry current at the merge and materializes
+unread exceptions only where the pre-merge state was unread. For an identity collision where the
+user had both subscriptions, the visible-unread-wins rule above chooses the pre-merge state.
+
+Target Entries retain their observation positions. Source-only Entries receive consecutive target
+positions after the prior target maximum, ordered by source position and then Entry ID; identity
+collisions keep the target Entry and position. The target Feed counter advances through those
+assignments in the merge transaction, so Entries published after the merge compare newer than the
+reconciled watermarks.
 
 #### Content version
 
@@ -297,9 +402,10 @@ reference always change in one PostgreSQL transaction.
    the key already existed. It verifies the exact version ID, compressed length and SHA-256, strict
    envelope decoder and internal integrity checks, proposed content version, and representation
    digest reconstructed with pending metadata. HEAD and ETag checks cannot mark an object verified.
-5. The publication transaction checks the intent fence, persisted feed-refresh generation, and Entry
-   base object, version, and digest. It atomically installs the proposed Entry data and marks the
-   new object current. A former current object becomes orphaned in the same transaction. A
+5. For a new Entry, the publication transaction locks the Feed before the Entry and assigns the next
+   observation position. It then checks the intent fence, persisted feed-refresh generation, and
+   Entry base object, version, and digest. It atomically installs the proposed Entry data and marks
+   the new object current. A former current object becomes orphaned in the same transaction. A
    `recovery_repair` instead moves its restored noncurrent base metadata to recovery quarantine
    under the existing lifecycle deadline.
 
@@ -379,6 +485,10 @@ Possible state:
 
 Avoid one row for every delivered user-entry pair.
 
+Saved, progress, last-opened, and explicit read state are independently mutable components even when
+they share one physical row. A read-state change cannot overwrite a newer value of another
+component.
+
 ### Fetch attempt
 
 Records operational history for one feed request, including safe diagnostics such as outcome class,
@@ -402,6 +512,14 @@ Contains:
 
 Unread state combines a per-subscription watermark with sparse entry exceptions.
 
+Each Feed owns a monotonic observation counter. The final publication transaction locks the Feed,
+increments the counter, and assigns that position when a new Entry first becomes visible. Import and
+mark-scope transactions lock affected Feeds in stable ID order before reading their counters, so a
+concurrent Entry is either included in the captured watermark or receives a strictly later position.
+Watermarks and scope boundaries use this position, not publisher dates, so a newly observed
+backdated Entry is still newer than an earlier watermark. Feed merges reconcile positions and user
+state as defined above.
+
 ### Subscribe or import
 
 - Import currently available entries for browsing.
@@ -419,25 +537,78 @@ Unread state combines a per-subscription watermark with sparse entry exceptions.
 
 ### Mark scope read
 
-- Advance the relevant subscription watermarks to the scope boundary.
-- Remove sparse read exceptions made redundant by the new watermarks.
-- Preserve saved and progress state.
-- Keep enough mutation context for the product's temporary undo window.
+Through beta, a scope is one active subscription, the active subscriptions captured from one folder,
+or all active subscriptions. Saved and search-result lists are not watermark scopes and do not
+expose this bulk action.
+
+- Snapshot the exact member subscription IDs and each subscription's latest observed position when
+  the command starts. Folder changes, new subscriptions, and new Entry observations after that
+  snapshot are outside the operation.
+- Advance each captured subscription watermark to its captured boundary without moving any watermark
+  backward.
+- Clear explicit read and unread markers at or before those boundaries. This marks the complete
+  captured scope read, including entries previously marked unread, and removes read markers made
+  redundant by the new watermarks.
+- Preserve saved, progress, and last-opened state.
+- Keep one server-owned undo context containing the operation ID, user, scope description, captured
+  subscription IDs and boundaries, before-and-after watermarks, cleared read-marker before-images,
+  and read-component mutation revisions.
 
 Folder-wide and global mark-read operations update the member subscriptions rather than introducing
 a second folder-level state model.
 
+### Undo mark scope read
+
+The mark-read commit sets `expires_at` from the PostgreSQL clock exactly 30 seconds later and
+returns the operation ID and that timestamp with context state `available`. Contexts transition once
+from `available` to `undone`, `superseded`, or `expired`; all three are terminal. Undo is accepted
+only for `available` while the database clock is strictly before `expires_at`. At or after expiry,
+the context is logically `expired` even before asynchronous cleanup records that state.
+
+A retry with the same mark-read idempotency key returns the same operation and does not extend
+expiry. Successful undo applies the restoration and records `undone` in one transaction. A retry of
+an `undone` operation returns its stored success without touching watermarks again; `superseded` or
+`expired` reports its terminal result and changes no state.
+
+Only the latest committed bulk mark-read operation for a user remains undoable. A later bulk
+mark-read commit atomically marks the prior unexpired `available` context `superseded`, including
+when it came from another device; a logically expired context remains `expired`. Ordinary open,
+mark-read, and mark-unread actions do not supersede it. Their read-component revisions make the
+later action win for that Entry, even if it restates the value currently implied by the temporary
+watermark. When undo could lower the watermark below that Entry, the later read action persists a
+read marker instead of becoming a representation-level no-op.
+
+Undo lowers each captured watermark to its before-value and restores every cleared read or unread
+marker whose read component has not received a later mutation. It recreates a missing sparse marker
+or merges it into the current row as needed. A later explicit read action remains read after the
+watermark is lowered; a later explicit unread action remains unread. Missing or unsubscribed
+subscriptions are skipped and never recreated.
+
+Undo never changes saved, progress, or last-opened components, including changes made during the
+window. It does not affect Entries observed after the captured boundary, subscriptions added later,
+or subscriptions that joined the folder later. Moving a captured subscription to another folder does
+not remove it from the undo because captured IDs, not current folder membership, define the
+operation.
+
+Example: subscription `S` has watermark 10, a read marker at Entry position 12, an unread marker at
+position 8, and a saved Entry at position 15. Marking through boundary 20 sets the watermark to 20
+and clears both read markers while retaining the save. An immediate undo returns the watermark to
+10, restores position 12 as read and position 8 as unread, and leaves position 15 saved. If the user
+explicitly marked position 14 unread after the bulk action, position 14 remains unread after undo.
+An Entry first observed at position 21 is unaffected throughout.
+
 ## Retention
 
-| Data                     | Retention                                            |
-| ------------------------ | ---------------------------------------------------- |
-| Invitation request       | 30 days from submission                              |
-| Ordinary sanitized body  | 90 days                                              |
-| Ordinary entry metadata  | 90 days                                              |
-| Saved body and metadata  | Until no user keeps the entry saved                  |
-| Read/progress exceptions | While required by retained entries and product state |
-| Orphaned object key      | Eight readable days from `orphaned_at`               |
-| Deleted object version   | Eight more days after its delete marker              |
+| Data                     | Retention                                                                |
+| ------------------------ | ------------------------------------------------------------------------ |
+| Invitation request       | 30 days from submission                                                  |
+| Ordinary sanitized body  | 90 days                                                                  |
+| Ordinary entry metadata  | 90 days                                                                  |
+| Saved body and metadata  | Until no user keeps the entry saved                                      |
+| Read/progress exceptions | While required by retained entries and product state                     |
+| Bulk-read undo context   | Undoable for 30 seconds; deleted asynchronously after any terminal state |
+| Orphaned object key      | Eight readable days from `orphaned_at`                                   |
+| Deleted object version   | Eight more days after its delete marker                                  |
 
 Image-cache policy lives in [`security.md`](security.md). Backup and recovery policy lives in
 [`deployment.md`](deployment.md).
@@ -496,7 +667,6 @@ bodies, or image files.
 These details remain deferred to schema and fixture design:
 
 - Primary-key representation
-- Nested OPML flattening, naming collisions, and duplicate-feed placement
 - Index selection and partition thresholds
 - Audit retention duration
-- Undo representation and expiry
+- Physical table and index representation for import runs and temporary undo context

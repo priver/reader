@@ -243,6 +243,11 @@ usable end-to-end paths. Test each path through every component it touches.
 7. Payload, entries, titles, site URLs, Atom `rel=self`, DNS aliases, and temporary redirects never
    merge Feeds.
 
+A merge first fences both Feeds in stable ID order. New publication, import finalization, and bulk
+watermark snapshots then defer while existing undo contexts reach a terminal state. The final
+transaction locks Feeds before Entries, reconciles observation positions and read state, and fences
+affected refreshes and publication intents.
+
 The complete path and query are public endpoint identity. The exact normalization and capability-URL
 limits live in [`0007-feed-url-policy.md`](decisions/0007-feed-url-policy.md).
 
@@ -265,9 +270,10 @@ limits live in [`0007-feed-url-policy.md`](decisions/0007-feed-url-policy.md).
    length and SHA-256, strictly decodes and integrity-checks the envelope, and reconstructs the
    representation digest from the body and proposed metadata. HEAD or ETag success is insufficient.
 9. One PostgreSQL transaction checks the publication and feed-generation fences and confirms that
-   the Entry still matches the intent's base. It then publishes all metadata, the content version,
-   and the current-object reference together and marks the prior object orphaned. This commit is the
-   only point at which the new representation becomes visible.
+   the Entry still matches the intent's base. For a new Entry it first locks the Feed and assigns
+   the next observation position. It then publishes all metadata, the content version, and the
+   current-object reference together and marks the prior object orphaned. This commit is the only
+   point at which the new representation becomes visible.
 10. A retry before upload regenerates the same object or abandons the fenced intent. A retry after
     upload repeats read-back verification. A retry after an ambiguous publication commit reads the
     current PostgreSQL reference and treats an exact match as success. A stale base or generation
@@ -285,6 +291,30 @@ provide correctness after lease expiry.
 
 The complete staging, retry, timing, and deletion protocol lives in
 [`0009-content-object-publication.md`](decisions/0009-content-object-publication.md).
+
+## OPML import lifecycle
+
+1. The API bounds and safely parses the uploaded XML before enqueueing network work. A structural
+   failure creates no import plan and no user data.
+2. After per-user rate and active-run checks, an accepted run persists an immutable, source-ordered
+   candidate plan and returns its import ID.
+3. Workers canonicalize candidates and resolve them through the normal safe feed endpoint lifecycle.
+   Permanent item failures stop immediately; transient failures receive at most five total attempts
+   within 24 hours.
+4. Once every candidate is resolved or terminal, the worker groups successful occurrences by final
+   Feed identity and chooses each Feed's earliest successful source occurrence. Completion order
+   does not select its folder.
+5. One finalization transaction preserves existing subscriptions and processes new Feed groups in
+   source order. Invalid folder names do not consume capacity; valid groups consume the remaining
+   slots, create only referenced flattened folders, and receive initial read watermarks.
+6. A finalization retry uses the import ID and persisted result to resolve an ambiguous commit. It
+   cannot create duplicate subscriptions, folders, or initial state.
+7. The API exposes separate occurrence and final Feed-group outcome counts plus at most 100
+   source-ordered item errors. Successful candidates remain imported when other candidates fail.
+
+Exact path, duplicate, capacity, and read-boundary behavior lives in
+[`data-model.md`](data-model.md#opml-path-flattening); parser limits live in
+[`security.md`](security.md#opml-import).
 
 ## Article read lifecycle
 
