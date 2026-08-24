@@ -40,6 +40,7 @@ Test deterministic domain behavior without network or database dependencies:
 - Invitation issuance, seven-day expiry, and redemption rules
 - imgproxy URL signing
 - Content-envelope version handling
+- Content-publication state, fencing, and cleanup eligibility
 
 ### Go integration tests
 
@@ -56,7 +57,8 @@ Cover:
 - Account deletion
 - Invitation request uniqueness, approval, and email-job enqueueing
 - Audit append behavior
-- Object metadata coordination and cleanup recovery
+- Content publication intents, restrictive current-reference foreign keys, deletion outbox, and
+  cleanup recovery
 
 Prefer a CI PostgreSQL service or disposable container to mocks of PostgreSQL semantics.
 
@@ -128,7 +130,8 @@ last-opened time keeps the latest value.
 - A pure envelope-structure or compression migration preserves the version when browser output is
   identical. A sanitizer migration that changes output increments it.
 - Duplicate candidates and failed publication retries never skip, decrement, or publish an
-  unverifiable version.
+  unverifiable version. An abandoned proposal for version 2 followed by a different successful
+  candidate still publishes version 2.
 - A synthetic maximum-version case refuses overflow beyond 9,007,199,254,740,991.
 
 #### Envelope and malformed content
@@ -158,7 +161,85 @@ Decoder fixtures reject:
 Compatibility fixtures run an overlap reader against the old and current envelope versions, prove
 that the old reader never receives new-version writes, and backfill ordinary and saved objects. They
 assert that structural rewrites preserve content version while visible output changes increment it,
-and that the old object remains readable through the recovery window.
+and that the old object remains directly readable for the full eight-day orphan grace and by exact
+version for the following eight-day deleted-version recovery window.
+
+#### Publication and cleanup fault contract
+
+Run publication tests against real PostgreSQL locking and foreign-key behavior plus the local
+S3-compatible service. Inject a stop or ambiguous result after every durable transition. Provider
+contract tests separately verify the required Yandex Object Storage semantics.
+
+Publication cases:
+
+- A failure before the PostgreSQL intent commit creates neither a tracked object nor an upload. An
+  unknown commit result is resolved by Entry, base, operation kind, target format, candidate digest,
+  and compressed digest before any PUT.
+- A committed intent followed by a pre-upload stop remains invisible. A retry with reproducible
+  bytes resumes its exact key; otherwise fenced recovery orphans it.
+- A failed or ambiguous PUT is resolved by full GET. A same-key retry never overwrites, and an
+  existing key with different bytes is quarantined and alerted.
+- Bucket policy rejects a worker PUT that omits `If-None-Match: *`, including an attempted overwrite
+  of a referenced key.
+- PUT or HEAD success alone cannot publish. Read-back rejects the wrong exact version, compressed
+  length, compressed SHA-256, content version, envelope integrity, schema, placeholder graph, image
+  projection, or reconstructed representation digest.
+- A stop after upload, after read-back, or after `verified` state converges on one verified object
+  and one current reference. No staged Entry shell appears in list, search, retention, or reader
+  queries.
+- The final transaction changes Entry metadata, representation digest, content version,
+  current-object reference, new-object state, and old-object state atomically.
+- A lost publication-commit response is recognized as success from the matching current reference
+  and digest. It does not create another intent or increment.
+- Concurrent same-candidate workers converge on one intent. Different candidates cannot both publish
+  from one base. A stale publication fence cannot verify or publish, and a stale feed-refresh
+  generation cannot publish an older response after a newer generation.
+- A failed proposed version does not consume that number. A to B to A still produces current
+  versions 1, 2, and 3, while a failed B followed by C produces versions 1 and 2.
+- A storage-only backfill has an explicit operation kind and target format, does not take the
+  publisher no-op path, and preserves the version only with an unchanged representation digest and
+  exact base-object compare-and-swap. Different format or compressed-byte targets cannot reuse one
+  intent. Feed merge and retention fence or orphan affected intents.
+
+Cleanup and timing cases:
+
+- PostgreSQL-clock tests reject cleanup immediately before the eight-day `gc_not_before` boundary
+  and allow a claim at the boundary. A live lease and the two-minute post-lease request bound delay
+  the claim even after that time.
+- Publication and cleanup race in both commit orders. The restrictive foreign key either preserves
+  the referenced object or prevents a later reference after the Content object row moves to the
+  deletion outbox.
+- Content object ownership and current-reference foreign keys both restrict and never cascade.
+  Retention keeps the hidden Entry shell until every owned object moves to the outbox, then removes
+  the shell.
+- Saved-item creation and retention race in both orders. Retention never removes a saved Entry, and
+  object cleanup does not bypass the retained Entry reference.
+- A pre-upload intent reaches `never_uploaded` only after lease and request quiescence, creates no
+  delete marker, and requires no Object Storage version ID.
+- A stop after the outbox claim but before `DeleteObject`, an ambiguous delete, and a stop after the
+  delete marker all converge on one marker. Every attempt rechecks current-key state; cleanup sends
+  no second delete when a marker is current and never sends a data-version ID for deletion.
+- Deleted-version recovery is guaranteed through at least the persisted delete-request start plus
+  eight days. A known failed request retried later extends that deadline; a lost response does not
+  shift it past the provider's actual lifecycle boundary.
+- The object remains normally readable throughout the first eight days. Exact-version GET succeeds
+  through a delete marker for at least eight more days; lifecycle purge cannot occur one instant
+  before that second boundary.
+- Current content keys never expire by age. A fresh worker configuration read gates cleanup.
+  Configuration drift that removes create-only PUT enforcement, suspends versioning, shortens
+  noncurrent-version retention, or adds current-key expiry halts publication or cleanup and raises
+  an alert.
+- Routine API and worker credentials cannot list content keys or versions. The temporary recovery
+  identity can inventory and read versions but cannot write or delete.
+- Restore inventory represents unknown current data keys as unowned quarantine records with a fresh
+  grace. Unknown noncurrent versions and delete markers remain read-only inventory until their
+  existing lifecycle expires and can never be published.
+- A restored live reference hidden by a marker or superseding data version is verified and rewritten
+  to a fresh storage-current key before promotion. The distinct `recovery_repair` operation bypasses
+  publisher and storage-migration no-op rules, preserves content version, format, bytes, and
+  representation digest, and moves the old metadata directly to recovery quarantine. Faults after
+  its intent, upload, verification, and commit converge through the normal fenced retry rules. The
+  fresh object remains readable after the old version's original lifecycle expiry.
 
 ### Feed URL fixture contract
 
@@ -341,12 +422,18 @@ Maintain explicit regression suites for:
 - Separation of `reader.mprvr.net/assets/` and signed `reader.mprvr.net/images/` routing
 - Cookieless image requests and stripped credentials before Nginx cache and imgproxy
 - Object Storage strict mode, private-endpoint policy conditions, TLS-only reads, and denial of
-  anonymous list, write, and delete operations
-- Authenticated API and worker content operations through the private endpoint, denial of unsigned
-  content reads, and denial of authenticated operations through the public endpoint or another
-  service connection
-- API denial of content list, write, and delete operations; worker denial of content list and bucket
-  administration; and denial of every out-of-prefix operation
+  anonymous list, version-read, write, and delete operations
+- Authenticated API and worker exact-version operations through the private endpoint, denial of
+  unsigned content reads, and denial through the public endpoint or another service connection
+- API denial of content list, write, and delete operations; worker denial of content and version
+  listing, permanent data-version deletion, and bucket administration; worker allowance for
+  read-only bucket policy, versioning, and lifecycle configuration; and denial of every
+  out-of-prefix operation
+- Temporary content-recovery inventory access only through its approved private workflow, denial of
+  its write and delete operations, and revocation before normal workers restart
+- Bucket-policy denial without the conditional-create header, verified read-after-write,
+  never-uploaded cleanup without a marker, one-marker convergence after ambiguous deletion, no age
+  expiry for current keys, and both eight-day lifecycle boundaries
 - Nginx denial from cloud metadata, Lockbox, content objects, browser manifests, and authenticated
   release operations
 - Stale-release 45-day boundaries, active and rollback overrides, and missing-asset `404` behavior
@@ -396,16 +483,28 @@ test targets.
 
 Before beta and after material storage changes:
 
-1. Restore Managed PostgreSQL to a new cluster from a selected point in time.
-2. Reconnect a disposable application color with least-privilege credentials.
-3. Verify Object Storage references and saved-body availability.
-4. Republish or reconnect the active end-user and admin browser releases from their signed manifests
+1. Stop publication and cleanup, revoke the old workers' Object Storage writes, prove that a write
+   is denied, wait out the two-minute request bound, and restore Managed PostgreSQL to a new cluster
+   from a selected point in time.
+2. Reconnect a disposable application color with least-privilege credentials while keeping its
+   workers disabled.
+3. Verify every current Object Storage reference by exact key and version, compressed digest,
+   envelope integrity, storage-current status, and saved-body availability. Rewrite a reference
+   hidden by a delete marker or superseding data version to a fresh key through `recovery_repair`,
+   then verify it again.
+4. Use the temporary recovery identity to inventory keys and versions. Import unknown current data
+   keys as unowned quarantine records with a fresh eight-day grace. Keep unknown noncurrent versions
+   and markers as read-only inventory until lifecycle expiry; do not delete from a live production
+   bucket during a drill.
+5. Revoke the recovery identity before enabling workers.
+6. Republish or reconnect the active end-user and admin browser releases from their signed manifests
    and verify end-user imports through Cloudflare and admin imports through Bastion.
-5. Verify the restored color resolves Object Storage through the allowed VPC service connection.
-6. Verify Kratos login and application identity mapping.
-7. Measure recovery against the targets in [`deployment.md`](deployment.md#backups-and-recovery).
+7. Verify the restored color resolves Object Storage through the allowed VPC service connection.
+8. Verify Kratos login and application identity mapping.
+9. Measure recovery against the targets in [`deployment.md`](deployment.md#backups-and-recovery).
 
-Record the drill date, duration, gaps, and corrective actions.
+Cross the original noncurrent-version expiry of a repaired reference and prove that the fresh
+current key remains readable. Record the drill date, duration, gaps, and corrective actions.
 
 ## Completion criteria
 

@@ -195,7 +195,11 @@ exception requires explicit review and documentation.
 - Parse and normalize entries.
 - Sanitize feed-provided article bodies and store app-owned image placeholders plus an image
   manifest.
-- Store metadata transactionally and content envelopes in Object Storage.
+- Commit a PostgreSQL publication intent before uploading each immutable content envelope.
+- Read back and fully verify an uploaded envelope before atomically publishing its metadata and
+  current-object reference.
+- Recover fenced publication attempts and remove only PostgreSQL-declared orphans after their
+  recovery windows.
 - Deliver invitation email jobs through Postbox.
 - Run retention, orphan cleanup, and OPML import and export jobs.
 
@@ -246,22 +250,41 @@ limits live in [`0007-feed-url-policy.md`](decisions/0007-feed-url-policy.md).
 
 1. A scheduler selects due feeds from persisted `next_fetch_at` values.
 2. River receives a unique feed-refresh job.
-3. The worker fetches the canonical endpoint with conditional headers, redirect reconciliation, and
-   safe-network checks.
+3. The worker claims a persisted feed-refresh generation, then fetches the canonical endpoint with
+   conditional headers, redirect reconciliation, and safe-network checks.
 4. The worker parses RSS or Atom and resolves versioned feed-scoped entry keys.
 5. The worker normalizes and sanitizes candidates, groups duplicate keys with the deterministic
    representation rule, and selects one candidate per key. An unchanged digest is a no-op; a changed
    digest receives the next content version.
-6. The worker makes the canonical gzip envelope and metadata visible through an idempotent
-   coordination protocol.
-7. The worker never publishes a content reference before its Object Storage object is readable.
-8. Retries recover incomplete work and asynchronous cleanup removes unreferenced objects.
-9. The worker records outcome, latency, validators, and publication history.
-10. The scheduler derives the next interval from publication cadence and bounds it by freshness and
-    backoff rules.
+6. In PostgreSQL, the worker locks the Entry and commits a fenced publication intent with an opaque,
+   immutable object key, the current compare-and-swap base, proposed metadata, and expected digests.
+   A new Entry shell remains hidden until publication.
+7. After that commit, the lease holder conditionally uploads the deterministic gzip bytes directly
+   to the final key. It resolves ambiguous writes by reading the key rather than overwriting it.
+8. The worker performs a full read-back through the private endpoint. It verifies the compressed
+   length and SHA-256, strictly decodes and integrity-checks the envelope, and reconstructs the
+   representation digest from the body and proposed metadata. HEAD or ETag success is insufficient.
+9. One PostgreSQL transaction checks the publication and feed-generation fences and confirms that
+   the Entry still matches the intent's base. It then publishes all metadata, the content version,
+   and the current-object reference together and marks the prior object orphaned. This commit is the
+   only point at which the new representation becomes visible.
+10. A retry before upload regenerates the same object or abandons the fenced intent. A retry after
+    upload repeats read-back verification. A retry after an ambiguous publication commit reads the
+    current PostgreSQL reference and treats an exact match as success. A stale base or generation
+    can only orphan its unique object.
+11. Orphan cleanup waits the PostgreSQL recovery deadline, then moves an unreferenced object into a
+    deletion outbox in a transaction protected by the current-reference foreign key. Only afterward
+    does it check current-key state: a never-uploaded key completes without a marker, while an
+    expected data version receives one marker and remains recoverable by exact version.
+12. The worker records outcome, latency, validators, and publication history. The scheduler derives
+    the next interval from publication cadence and bounds it by freshness and backoff rules.
 
 Manual refresh enqueues the same unique work. It never creates a second fetch for a feed already in
-progress.
+progress. River uniqueness reduces duplicate work; the persisted generation and publication fences
+provide correctness after lease expiry.
+
+The complete staging, retry, timing, and deletion protocol lives in
+[`0009-content-object-publication.md`](decisions/0009-content-object-publication.md).
 
 ## Article read lifecycle
 
@@ -362,3 +385,4 @@ These are pre-beta design and load-test targets, not a promise of public-service
 - [`0006-static-spa-delivery.md`](decisions/0006-static-spa-delivery.md)
 - [`0007-feed-url-policy.md`](decisions/0007-feed-url-policy.md)
 - [`0008-entry-content-contracts.md`](decisions/0008-entry-content-contracts.md)
+- [`0009-content-object-publication.md`](decisions/0009-content-object-publication.md)
