@@ -107,6 +107,27 @@ candidates, and never executes publisher scripts. Set the exact discovery byte a
 during implementation, then lock them with tests. These caps cannot exceed the feed-fetch response
 cap.
 
+## OPML import
+
+Treat uploaded OPML as hostile XML. Accept only an uncompressed document of at most 5 MiB, at most
+10,000 XML elements, at most 5,000 `<outline>` elements, at most 1,000 outlines with a nonempty
+`xmlUrl`, and an XML element nesting depth of at most 32 below `<body>`. Require one unqualified
+`<opml>` root with exactly one direct `<body>`. Reject the whole document before scheduling network
+work when any limit is exceeded, XML is malformed, or the root or body is invalid. The XML parser
+must reject DTDs, custom general or parameter entity declarations, and XInclude while retaining
+XML's predefined entities; it performs no file or network resolution.
+
+Unknown elements and attributes may be ignored only while all limits continue to count them. Bound
+stored and returned error details to the first 100 occurrence-level or Feed-level item failures in
+source order, with aggregate counts for the remainder. Every accepted `xmlUrl` then uses the normal
+feed URL, SSRF, redirect, response-size, timeout, and publisher-concurrency policy. An OPML upload
+never grants a different network capability from direct feed addition.
+
+Allow at most one resolving or finalizing import run and five OPML upload attempts per user in a
+rolling hour. A transport retry carrying the same upload idempotency key returns the same run and
+does not consume another allowance. Apply the ordinary authenticated mutation and request-body rate
+limits in addition to these caps.
+
 ## Feed HTML pipeline
 
 Stored article bodies come only from RSS or Atom fields.

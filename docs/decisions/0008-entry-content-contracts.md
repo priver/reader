@@ -65,10 +65,11 @@ lexicographically smallest SHA-256 digest of the normalized durable representati
 retains the target Feed's Entry when keys collide, retargets user state and saved references, and
 applies the same representation selection. Non-colliding keys remain separate.
 
-If one user has state on both colliding Entries, saved combines with OR, explicit unread wins over
-read, progress keeps the furthest value, and last-opened time keeps the latest value. When the
-selected source representation changes the surviving target Entry, its content version increments
-under the normal publisher-revision rule.
+If one user has state on both colliding Entries, saved combines with OR, resolved visible unread
+wins over visible read after applying each subscription watermark and sparse marker, progress keeps
+the furthest value, and last-opened time keeps the latest value. When the selected source
+representation changes the surviving target Entry, its content version increments under the normal
+publisher-revision rule.
 
 ### Publisher revisions
 

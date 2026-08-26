@@ -34,7 +34,9 @@ Test deterministic domain behavior without network or database dependencies:
 - Failure backoff and cooldown
 - Feed URL classification, canonicalization, redirect identity, and endpoint deduplication
 - Feed-scoped entry identity
+- OPML path flattening, duplicate placement, limits, and retry classification
 - Read watermark and exception transitions
+- Bulk mark-read snapshots, expiry, and undo conflict handling
 - Retention decisions
 - Invitation request deduplication, resolution, and 30-day expiry
 - Invitation issuance, seven-day expiry, and redemption rules
@@ -52,7 +54,9 @@ Cover:
 - sqlc queries and ownership scoping
 - River enqueue, uniqueness, retry, and leader behavior
 - Subscription and folder constraints
+- OPML import finalization, idempotency, partial errors, and subscription-limit ordering
 - Sparse read state and bulk watermark updates
+- Bulk-read undo with concurrent per-entry and saved-state changes
 - Saved-item retention
 - Account deletion
 - Invitation request uniqueness, approval, and email-job enqueueing
@@ -113,8 +117,14 @@ two items compare equal.
 A Feed-merge fixture contains one colliding publisher key, one source-only key, one target-only key,
 and two distinct IDs sharing one link. The target Entry survives the collision, source-only entries
 move, different keys remain separate, and the duplicate winner is independent of processing order.
-Saved flags combine with OR, explicit unread wins over read, progress keeps the furthest value, and
-last-opened time keeps the latest value.
+Saved flags combine with OR, resolved visible unread wins over read, progress keeps the furthest
+value, and last-opened time keeps the latest value. Source-only, target-only, and dual-subscription
+users retain the visible read state of Entries they already followed, gain the other Feed's Entries
+as read, and receive future Entries as unread after deterministic source-position reassignment. An
+available bulk-read undo context delays the merge until undo or expiry. A dual subscription with one
+watermark-implied unread copy and one read copy resolves unread even without a sparse state row.
+Fence races with publication and bulk mark-read in both commit orders follow Feed-then-Entry lock
+order, create no post-fence undo context, and do not deadlock.
 
 #### Publisher updates
 
@@ -189,6 +199,9 @@ Publication cases:
   queries.
 - The final transaction changes Entry metadata, representation digest, content version,
   current-object reference, new-object state, and old-object state atomically.
+- A new Entry receives its Feed observation position only in the final publication transaction. A
+  mark-scope or import boundary racing publication either includes that Entry or leaves it strictly
+  newer than the captured watermark.
 - A lost publication-commit response is recognized as success from the matching current reference
   and digest. It does not create another intent or increment.
 - Concurrent same-candidate workers converge on one intent. Different candidates cannot both publish
@@ -290,6 +303,67 @@ SSRF cases:
 
 Store only fixtures that the project can redistribute. Create a minimal reproduction when a real
 response cannot be committed safely.
+
+### OPML and read-state fixture contract
+
+Issues #8 and #12 materialize the importer, bulk action, and these versioned fixtures. OPML golden
+cases assert the ordered candidate plan, normalized folder names, final Feed grouping, selected
+placement, aggregate outcomes, and bounded source-ordered error details.
+
+OPML fixtures cover:
+
+- `Tech` then `Security` flattening to `Tech / Security`, a later literal `Tech / Security`
+  component receiving `Tech / Security (2)`, repeated equal paths reusing one folder, unnamed
+  wrappers, and top-level feeds remaining unfiled. Reversing path order reverses which source path
+  receives the base name but not the source-order rule.
+- A literal `Tech / Security (2)` path following the generated suffix receives
+  `Tech / Security (2) (2)`. A retry keeps those claims, while a later independent run recalculates
+  names only for subscriptions it can newly add.
+- Unicode NFC and whitespace normalization coalescing equal paths while case-distinct names remain
+  separate. A 255-byte normalized folder name succeeds and a 256-byte name fails without truncation.
+- One URL repeated in different folders, two permanent aliases resolving to one Feed, and two source
+  endpoints temporarily redirecting to the same target while remaining distinct. The earliest
+  successful source occurrence chooses placement even when workers finish in reverse order and even
+  when that occurrence is unfiled.
+- An existing subscription retaining its folder and private state, imported folder names reusing
+  existing folders, and a repeated finalization or repeated upload creating no duplicates.
+- Capacity with existing subscriptions, aliases, and more successful new Feeds than available slots.
+  Winning occurrences consume slots in source order and every remainder reports `subscription_limit`
+  without creating an empty folder. An over-255-byte folder result does not consume the last slot,
+  and the next valid Feed backfills it.
+- Exact occurrence counts for permanent failure, retry exhaustion, winner, and duplicate plus exact
+  Feed-group counts for imported, `already_subscribed`, `folder_name`, and `subscription_limit`.
+  Duplicate and already-subscribed outcomes produce no error detail; Feed errors use the winning
+  source ordinal.
+- Permanent malformed or blocked URL, authoritative DNS absence, redirect-policy, certificate,
+  response-size, nonretryable `4xx`, and invalid-feed errors alongside retryable temporary DNS,
+  transport, timeout, `408`, `425`, `429`, and `5xx` outcomes. Retries stop after five total
+  attempts or before the 24-hour boundary, ignore invalid `Retry-After`, honor an in-range value,
+  and converge after an ambiguous finalization commit. No attempt starts exactly at the deadline.
+- A second active run is rejected, the sixth upload attempt in a rolling hour is rate-limited, and
+  an idempotent transport retry returns the original run without consuming another allowance.
+- Rejection at 5 MiB plus one byte, XML element 10,001, outline 5,001, feed occurrence 1,001, and
+  depth 33, with boundary fixtures accepted. Malformed XML, an invalid root or body, DTDs, custom
+  entities, and XInclude cause no network or user-data mutation. Predefined XML entities remain
+  accepted. Error detail 101 is counted but not returned.
+
+Read-state table fixtures use monotonic Feed-local Entry observation positions rather than publisher
+dates and cover:
+
+- A watermark at 10, a read marker at 12, and an unread marker at 8 marked through boundary 20, then
+  restored exactly by undo while an Entry first observed at 21 remains unread.
+- A folder membership snapshot where a captured subscription later moves out, another joins, and one
+  is deleted. Undo affects the moved subscription, ignores the new member, and does not recreate the
+  deleted subscription.
+- Read, unread, open, save, progress, and last-opened mutations during the undo window. Later
+  read-component mutations win per Entry; all non-read components survive both mark-read and undo.
+- PostgreSQL-clock checks immediately before and exactly at the 30-second boundary, same-key action
+  retries that do not extend expiry, idempotent undo retries, and supersession by a later bulk
+  action from another device.
+- `available`, `undone`, `superseded`, and `expired` context transitions, including a stored undo
+  result that cannot reapply old Feed-local watermarks after a later Feed merge.
+- Feed, folder, and all-subscriptions scopes capture only active subscriptions. Saved and search
+  results expose no bulk watermark action.
 
 ### Frontend tests
 
@@ -403,6 +477,7 @@ Maintain explicit regression suites for:
 - IPv4 and IPv6 private, loopback, link-local, and metadata addresses
 - Compressed response expansion
 - XML and HTML parser limits
+- OPML DTD, entity, XInclude, structure, depth, count, upload-rate, and active-run limits
 - Sanitizer XSS and DOM-clobbering cases
 - imgproxy signature changes and preset tampering
 - Image bombs, oversized files, redirects, and SVG scripts

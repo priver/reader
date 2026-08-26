@@ -72,6 +72,13 @@ and authorized administrators, but it provides no private-feed or token-redactio
 exact endpoint and deduplication rules live in
 [`0007-feed-url-policy.md`](decisions/0007-feed-url-policy.md).
 
+OPML import runs as bounded background work and may complete with both imported feeds and item-level
+errors. Nested groups appear as one path-like folder name; distinct source paths that flatten to the
+same name receive stable numeric suffixes within that import. If the same Feed appears more than
+once, the first successfully resolved occurrence in document order selects its imported folder.
+Import never moves an existing subscription. Retrying a run cannot create duplicate folders or
+subscriptions.
+
 ### Reading
 
 - Open on all unread articles, newest first.
@@ -84,9 +91,15 @@ exact endpoint and deduplication rules live in
 - Synchronize coarse reading progress across devices.
 - Ask whether to resume an in-progress article.
 - Search retained article titles and source names.
-- Mark the current scope read with a temporary undo action.
+- Mark the current scope read with a server-backed undo action available for 30 seconds.
 - Support standard reader shortcuts and discoverable shortcut help.
 - Support mobile swipe actions for read state and saving with undo.
+
+Bulk mark-read snapshots the subscriptions and entries in scope when the action starts. Entries
+observed afterward remain unread. Undo restores that snapshot without reverting later explicit read
+actions, saves, progress, or last-opened state. Through beta, bulk scopes are one active feed, one
+folder's active subscriptions, or all active subscriptions; Saved and search results do not expose
+the bulk action.
 
 ### Refresh
 
